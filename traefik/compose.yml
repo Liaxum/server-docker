@@ -1,0 +1,77 @@
+services:
+  core:
+    image: traefik:latest
+    command:
+      # --- API & Dashboard ---
+      - "--api.dashboard=true"
+      - "--api.insecure=true"
+      
+      # --- THE FIX: Pure Swarm Provider (No Docker flags) ---
+      - "--providers.swarm=true"
+      - "--providers.swarm.exposedbydefault=false"
+      - "--providers.swarm.network=web-net"
+      
+      # --- File Provider (SSL) ---
+      - "--providers.file.filename=/etc/traefik/dynamic.yml"
+      - "--providers.file.watch=true"
+
+      # --- Entrypoints ---
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+
+      # --- Global HTTPS Redirection ---
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--entrypoints.websecure.http.tls=true"
+
+      # --- Logging (Optional: Helps debug errors) ---
+      - "--log.level=INFO"
+
+    ports:
+      - target: 80
+        published: 80
+        protocol: tcp
+        mode: host
+      - target: 443
+        published: 443
+        protocol: tcp
+        mode: host
+      - target: 8080
+        published: 8080
+        protocol: tcp
+        mode: host
+        
+    volumes:
+      # Mount the socket
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      
+    networks:
+      - web-net
+      
+    secrets:
+      - liaxum_crt
+      - liaxum_key
+    
+    configs:
+      - source: traefik_dynamic
+        target: /etc/traefik/dynamic.yml
+      
+    deploy:
+      mode: global
+      placement:
+        constraints:
+          - node.role == manager
+
+networks:
+  web-net:
+    external: true
+
+secrets:
+  liaxum_crt:
+    external: true
+  liaxum_key:
+    external: true
+
+configs:
+  traefik_dynamic:
+    external: true

@@ -1,0 +1,39 @@
+services:
+  proxy:
+    image: itzg/velocity:latest
+    container_name: velocity
+    environment:
+      - TYPE=VELOCITY
+      - EULA=TRUE
+      - VELOCITY_SECRET=secure-liaxum-forwarding-secret  # ⚠️ Copy this! You need it for the backend servers later.
+      - DEBUG=false
+      - VELOCITY_SERVERS=lobby:25565,survival:25565
+      - VELOCITY_RCON_PORT=25575
+      - VELOCITY_RCON_PASSWORD=secure-rcon-password
+      - MOTD=\u00A7bLiaxum Network \u00A77| \u00A7fVelocity Powered
+    ports:
+      # The Public Minecraft Port (Open to the world on VPS)
+      - target: 25565
+        published: 25565
+        protocol: tcp
+        mode: host
+    networks:
+      - minecraft-net
+    volumes:
+      - velocity-data:/data
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          # MUST run on VPS to have the public IP
+          - node.hostname == liaxum-vps
+      restart_policy:
+        condition: on-failure
+
+networks:
+  minecraft-net:
+    driver: overlay
+    attachable: true
+
+volumes:
+  velocity-data:

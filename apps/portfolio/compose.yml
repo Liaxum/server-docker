@@ -1,0 +1,18 @@
+services:
+  core:
+    image: liaxum/portfolio:latest
+    networks:
+      - web-net
+    deploy:
+      replicas: 1
+      labels:
+          - "traefik.enable=true"
+          - "traefik.swarm.network=web-net"
+          - "traefik.http.routers.portfolio.rule=Host(`liaxum.fr`)"
+          - "traefik.http.routers.portfolio.entrypoints=websecure"
+          - "traefik.http.routers.portfolio.tls=true"
+          - "traefik.http.services.portfolio.loadbalancer.server.port=3000"
+
+networks:
+  web-net:
+    external: true

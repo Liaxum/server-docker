@@ -1,0 +1,7 @@
+tls:
+  stores:
+    default:
+      defaultCertificate:
+        # Secrets are ALWAYS mounted at /run/secrets/
+        certFile: /run/secrets/liaxum_crt
+        keyFile: /run/secrets/liaxum_key
