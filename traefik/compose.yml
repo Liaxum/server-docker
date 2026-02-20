@@ -60,7 +60,7 @@ services:
       mode: global
       placement:
         constraints:
-          - node.role == manager
+          - node.hostname == liaxum-vps
 
 networks:
   web-net:

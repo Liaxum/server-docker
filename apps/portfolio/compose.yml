@@ -5,6 +5,9 @@ services:
       - web-net
     deploy:
       replicas: 1
+      placement:
+        constraints:
+          - node.hostname != liaxum-gaming
       labels:
           - "traefik.enable=true"
           - "traefik.swarm.network=web-net"
