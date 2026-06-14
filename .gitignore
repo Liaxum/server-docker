@@ -1,3 +1,9 @@
 # Raw certificate files from CA (converted to .pem before use)
 *.key
 *.cer
+
+# Secrets
+*.pem
+traefik/secret/
+**/.env
+**/*.env
