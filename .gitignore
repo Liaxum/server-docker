@@ -1,0 +1,3 @@
+# Raw certificate files from CA (converted to .pem before use)
+*.key
+*.cer

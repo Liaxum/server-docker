@@ -12,7 +12,7 @@ services:
       replicas: 1
       placement:
         constraints:
-          - node.hostname == liaxum-mini
+          - node.hostname == liaxum-vps
 
   # --- 2. Komodo Core (The Brain) ---
   core:
@@ -34,7 +34,7 @@ services:
       replicas: 1
       placement:
         constraints:
-          - node.hostname != liaxum-gaming
+          - node.hostname == liaxum-vps
 
       labels:
         # Traefik v3 Config
