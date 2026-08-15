@@ -1,43 +1,35 @@
 version: '3.8'
 
 services:
-  # --- 1. Database (MongoDB) ---
   mongo:
-    image: mongo:latest   # <--- Updated to Latest
+    image: mongo:6
     volumes:
       - mongo-data:/data/db
+      - mongo-config:/data/configdb
     networks:
       - komodo-net
     deploy:
-      replicas: 1
       placement:
         constraints:
           - node.hostname == liaxum-vps
 
-  # --- 2. Komodo Core (The Brain) ---
   core:
-    image: ghcr.io/moghtech/komodo-core:latest
-    depends_on:
-      - mongo
+    image: ghcr.io/moghtech/komodo-core:2
     environment:
       - KOMODO_DATABASE_ADDRESS=mongo:27017
-      - KOMODO_PASSKEY=secure-liaxum-passkey
+      - KOMODO_JWT_SECRET=super_secret_jwt_12345
+      - KOMODO_WEBHOOK_SECRET=super_secret_webhook_12345
       - KOMODO_LOCAL_AUTH=true
-      - KOMODO_INIT_ADMIN_USERNAME=admin
-      - KOMODO_INIT_ADMIN_PASSWORD=admin
     volumes:
-      - komodo-data:/etc/komodo
+      - keys:/config/keys
     networks:
-      - web-net      # Public access
-      - komodo-net   # Talk to Mongo & Agents
+      - web-net
+      - komodo-net
     deploy:
-      replicas: 1
       placement:
         constraints:
           - node.hostname == liaxum-vps
-
       labels:
-        # Traefik v3 Config
         - "traefik.enable=true"
         - "traefik.swarm.network=web-net"
         - "traefik.http.routers.komodo.rule=Host(`monitor.liaxum.fr`)"
@@ -45,27 +37,44 @@ services:
         - "traefik.http.routers.komodo.tls=true"
         - "traefik.http.services.komodo.loadbalancer.server.port=9120"
 
-  # --- 3. Periphery (The Agents) ---
   periphery:
-    image: ghcr.io/moghtech/komodo-periphery:latest
+    image: ghcr.io/moghtech/komodo-periphery:2
     environment:
-      - PERIPHERY_PASSKEY=secure-liaxum-passkey
-    ports:
-      # Expose port 8120 so Core can reach it via VPN IP
-      - target: 8120
-        published: 8120
-        protocol: tcp
-        mode: host
+      - PERIPHERY_CORE_ADDRESS=wss://monitor.liaxum.fr
+      - PERIPHERY_CONNECT_AS=Local
+      - PERIPHERY_CORE_PUBLIC_KEYS=file:/config/keys/core.pub
+      - PERIPHERY_ONBOARDING_KEY=O_CBCRBSTQ3eKKROtQdXMICDCd1NLM_O
     volumes:
+      - keys:/config/keys
       - /var/run/docker.sock:/var/run/docker.sock
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
-    deploy:
-      mode: global  # Runs on VPS, Mini, Gaming, and any future node
-      restart_policy:
-        condition: on-failure
+      - /proc:/proc
     networks:
       - komodo-net
+    deploy:
+      mode: global
+  
+  mcp:
+    image: ghcr.io/myrikld/komodo-mcp:latest
+    environment:
+      - KOMODO_MCP_KOMODO_URL=https://monitor.liaxum.fr
+      - KOMODO_MCP_KOMODO_API_KEY=K_d7XqOnTpGduUmUH74C7t8iwhhCgYN4qqgczNGN64_K
+      - KOMODO_MCP_KOMODO_API_SECRET=S_7nqRoUAZtzENIX0slKeb2siVleJfUg1j7beWUTmM_S
+    networks:
+      - web-net
+      - komodo-net
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.hostname == liaxum-vps
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=web-net"
+        # We will expose this on a separate subdomain for the AI
+        - "traefik.http.routers.komodomcp.rule=Host(`mcp.liaxum.fr`)"
+        - "traefik.http.routers.komodomcp.entrypoints=websecure"
+        - "traefik.http.routers.komodomcp.tls=true"
+        - "traefik.http.services.komodomcp.loadbalancer.server.port=8000"
 
 networks:
   web-net:
@@ -76,4 +85,5 @@ networks:
 
 volumes:
   mongo-data:
-  komodo-data:
+  mongo-config:
+  keys:

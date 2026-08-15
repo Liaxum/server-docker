@@ -1,0 +1,64 @@
+services:
+  core:
+    image: 'gitlab/gitlab-ee:latest'
+    hostname: 'gitlab.example.com'
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        # Your external URL (use https:// if you are setting up SSL later)
+        external_url 'https://gitlab.liaxum.fr'
+
+        nginx['listen_port'] = 80
+        nginx['listen_https'] = false
+
+        # Tell GitLab to TRUST the Traefik internal Docker IPs
+        gitlab_rails['trusted_proxies'] = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']
+        nginx['real_ip_trusted_addresses'] = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']
+
+        # Map SSH to a different port to avoid conflicting with your server's native SSH
+        gitlab_rails['gitlab_shell_ssh_port'] = 2224
+
+        # Enable GitLab.com OmniAuth Integration
+        gitlab_rails['omniauth_enabled'] = true
+        gitlab_rails['omniauth_allow_single_sign_on'] = ['gitlab']
+        gitlab_rails['omniauth_block_auto_created_users'] = false
+        gitlab_rails['omniauth_providers'] = [
+          {
+            "name" => "gitlab",
+            "app_id" => "7d554db0a031b71914a8607e4b099eac67b2c17d5a9f79b5970c2b9461c67757",
+            "app_secret" => "gloas-d53bdf8994b64e12b6452bc3f9a1e244eed8c44983dc4e7d0e7faad687d4e609",
+            "args" => { "scope" => "api" }
+          }
+        ]
+    ports:
+      - '2224:22'
+    volumes:
+      - 'gitlab_config:/etc/gitlab'
+      - 'gitlab_logs:/var/log/gitlab'
+      - 'gitlab_data:/var/opt/gitlab'
+    networks:
+      - web-net
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          # This ensures GitLab always boots on the same node, 
+          # which is critical so it doesn't lose access to its local data volumes.
+          - node.role == manager
+      restart_policy:
+        condition: any
+      labels:
+          - "traefik.enable=true"
+          - "traefik.swarm.network=web-net"
+          - "traefik.http.routers.gitlab.rule=Host(`gitlab.liaxum.fr`)"
+          - "traefik.http.routers.gitlab.entrypoints=websecure"
+          - "traefik.http.routers.gitlab.tls=true"
+          - "traefik.http.services.gitlab.loadbalancer.server.port=80"
+
+networks:
+  web-net:
+    external: true
+
+volumes:
+  gitlab_config:
+  gitlab_logs:
+  gitlab_data:

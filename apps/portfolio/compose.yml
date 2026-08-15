@@ -1,6 +1,6 @@
 services:
   core:
-    image: liaxum/portfolio:latest
+    image: ghcr.io/liaxum/portfolio:latest
     networks:
       - web-net
     deploy:
