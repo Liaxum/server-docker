@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   mongo:
     image: mongo:6
@@ -41,7 +39,7 @@ services:
     image: ghcr.io/moghtech/komodo-periphery:2
     environment:
       - PERIPHERY_CORE_ADDRESS=wss://monitor.liaxum.fr
-      - PERIPHERY_CONNECT_AS=Local
+      - PERIPHERY_CONNECT_AS={{ .Node.Hostname }}
       - PERIPHERY_CORE_PUBLIC_KEYS=file:/config/keys/core.pub
       - PERIPHERY_ONBOARDING_KEY=O_CBCRBSTQ3eKKROtQdXMICDCd1NLM_O
     volumes:
