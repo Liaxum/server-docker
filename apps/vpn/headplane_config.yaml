@@ -1,0 +1,6 @@
+headscale:
+  url: "http://vpn_core:8080"
+  public_url: "https://vpn.liaxum.fr"
+  api_key: "hskey-api-_iju3s8opk0T-E3V4z7v3s62LgocO5GI-25GnI4oR-xouc2khoL3nK62h7v33boqVEP7AasvPLzyI"
+server:
+  cookie_secret: "5c2e337bdcbdcc8a1a2857bc96e7d30d"

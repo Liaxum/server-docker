@@ -1,0 +1,57 @@
+networks:
+  web-net:
+    external: true
+
+configs:
+  headscale_config:
+    file: ./config.yaml
+  headplane_config:
+    file: ./headplane_config.yaml
+
+services:
+  core:
+    image: docker.io/headscale/headscale:latest
+    container_name: headscale
+    restart: unless-stopped
+    command: serve
+    configs:
+      - source: headscale_config
+        target: /etc/headscale/config.yaml
+    volumes:
+      - /opt/vpn/data:/var/lib/headscale
+    networks:
+      - web-net
+    healthcheck:
+      test: ["CMD", "headscale", "health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+      labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.headscale.rule=Host(`vpn.liaxum.fr`)"
+        - "traefik.http.routers.headscale.entrypoints=websecure"
+        - "traefik.http.routers.headscale.tls=true"
+        - "traefik.http.routers.headscale.tls.certresolver=letsencrypt"
+        - "traefik.http.services.headscale.loadbalancer.server.port=8080"
+
+  web:
+    image: ghcr.io/tale/headplane:latest
+    networks:
+      - web-net
+    configs:
+      - source: headplane_config
+        target: /etc/headplane/config.yaml
+    deploy:
+      replicas: 1
+      labels:
+        - "traefik.enable=true"
+        # Access it via a specific subdomain or path
+        - "traefik.http.routers.headplane.rule=Host(`vpn.liaxum.fr`) && PathPrefix(`/admin`)"
+        - "traefik.http.routers.headplane.entrypoints=websecure"
+        - "traefik.http.routers.headplane.tls=true"
+        - "traefik.http.services.headplane.loadbalancer.server.port=3000"

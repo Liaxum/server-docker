@@ -57,10 +57,10 @@ services:
         target: /etc/traefik/dynamic.yml
       
     deploy:
-      mode: global
+      replicas: 1
       placement:
         constraints:
-          - node.hostname == liaxum-vps
+          - node.role == manager
 
 networks:
   web-net:
