@@ -95,6 +95,6 @@ volumes:
     driver_opts:
       type: "nfs"
       o: "addr=100.64.0.1,rw,nfsvers=4,nolock,soft"
-      # /shared/monitor-keys must exist on the NFS server before deploying,
-      # otherwise every node caches a broken stub volume.
-      device: ":/shared/monitor-keys"
+      # Path is relative to the NFSv4 root, which the export pins to /shared
+      # with fsid=0 -- so this is /shared/monitor-keys on the server.
+      device: ":/monitor-keys"

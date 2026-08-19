@@ -133,20 +133,42 @@ than reporting a permission error — the lookup just returns ENOENT.
    The init sidecar in `apps/nfs/compose.yml` creates it, so this should only
    happen on a volume predating that service.
 
-2. The client's source address does not match any client spec on the export.
-   The VPS hits this mounting its own export: the request is DNAT'd through
-   the published port, so the server sees the Docker bridge gateway instead of
-   `100.64.0.1`. This is why the export carries a `172.16.0.0/12` spec
-   alongside the Tailscale range. Confirm what the server actually sees with:
+2. The server has no NFSv4 root, so *every* lookup fails. `/shared` is a
+   bind-mounted Docker volume living in the NFS container's mount namespace,
+   and nfsd cannot build a pseudo-filesystem that reaches it. `exportfs -v`
+   still lists the export quite happily, which makes this look like a path
+   problem. The export therefore carries `fsid=0`, pinning `/shared` as the
+   v4 root — which is why clients mount `:/monitor-keys` and not
+   `:/shared/monitor-keys`.
 
-   ```bash
-   docker exec nfs-server exportfs -v
-   docker logs --tail 40 nfs-server
-   ```
+3. The client's source address matches no client spec on the export. NFSv4
+   hides an unmatched export rather than refusing it. The VPS mounts its own
+   export through the published port, where the source is NAT'd to the Docker
+   bridge gateway, hence the `172.16.0.0/12` spec beside the Tailscale range.
+
+To tell these apart, mount at three depths from a throwaway container — no
+host access needed. `--network host` puts the mount in the same namespace
+dockerd uses for real volume mounts:
+
+```bash
+docker run --rm --privileged --network host alpine sh -c '
+apk add --no-cache nfs-utils >/dev/null 2>&1; mkdir -p /mnt/t
+for p in /monitor-keys /; do
+  echo "=== mounting 100.64.0.1:$p"
+  mount -t nfs4 -o nolock,soft 100.64.0.1:$p /mnt/t 2>&1 && { ls -la /mnt/t; umount /mnt/t; }
+done'
+```
+
+`/` failing too means there is no v4 root (cause 2). `/` working while a
+subpath fails means the directory or the ACL (causes 1 and 3).
 
 Swarm re-attempts the mount every time it restarts the task, so once the
 export is right the service recovers on its own; force it with
 `docker service update --force monitor_core` if you would rather not wait.
+
+Changing the volume's `device` or `o` options is different: Docker stores
+those on the volume at creation and ignores the updated stack file, so the
+volume has to be removed on every node first (see below).
 
 ### Purge cached NFS volumes across the cluster
 

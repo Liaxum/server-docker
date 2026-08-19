@@ -30,20 +30,24 @@ services:
     volumes:
       - nfs_data:/shared
     environment:
-      # Two client specs on one export:
-      #   100.64.0.0/10 - worker nodes reaching us over Tailscale.
-      #   172.16.0.0/12 - the VPS mounting its own export. That request is
-      #     DNAT'd through the published port, so the server sees the Docker
-      #     bridge gateway rather than 100.64.0.1. Without this spec the
-      #     export is invisible to it and NFSv4 answers lookups with
-      #     NFS4ERR_NOENT, which surfaces as "no such file or directory".
-      # Publishing on 100.64.0.1 only means the extra spec is reachable from
-      # this host and its containers, not from the public interface.
+      # fsid=0 makes /shared the NFSv4 root. It is a bind-mounted Docker
+      # volume, so it lives in this container's mount namespace and nfsd
+      # cannot build a pseudo-filesystem that reaches it -- without fsid=0
+      # the server has no v4 root at all and answers every lookup, even of
+      # "/", with NFS4ERR_NOENT ("no such file or directory"). Because
+      # /shared IS the root, clients address paths relative to it:
+      # /shared/monitor-keys on the server is :/monitor-keys to a client.
+      #
+      # Two client specs: 100.64.0.0/10 for worker nodes arriving over
+      # Tailscale, 172.16.0.0/12 for the VPS mounting its own export through
+      # the published port, where the source address is NAT'd to the Docker
+      # bridge gateway. The listener is bound to 100.64.0.1, so the second
+      # spec is reachable only from this host and its containers.
       #
       # all_squash + anonuid/anongid=1000 maps every client (which connects
       # as root) onto the same UID Filebrowser writes as, so the GUI and the
       # swarm services can read/write the same files.
-      - "NFS_EXPORT_0=/shared 100.64.0.0/10(rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000) 172.16.0.0/12(rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000)"
+      - "NFS_EXPORT_0=/shared 100.64.0.0/10(rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000,fsid=0) 172.16.0.0/12(rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000,fsid=0)"
 
 volumes:
   nfs_data:
