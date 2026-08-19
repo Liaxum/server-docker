@@ -47,7 +47,36 @@ sudo ufw reload
 docker network create --driver overlay --attachable web-net
 ```
 
+## Bootstrap
+
+`scripts/bootstrap.sh` brings the manager node up in dependency order and is
+safe to re-run — every stage checks before it acts.
+
+```bash
+./scripts/bootstrap.sh                    # deploy; host must already be ready
+./scripts/bootstrap.sh --with-host-setup  # also prepare the host (needs sudo)
+./scripts/bootstrap.sh --from nfs         # resume from a stage
+./scripts/bootstrap.sh --dry-run          # print what would run
+```
+
+Without `--with-host-setup` it touches nothing outside Docker: it checks the
+prerequisites and stops with the exact command to run if one is missing. With
+it, it installs the NFS client utilities, initialises the swarm, creates
+`/opt/vpn/data` and adds the ufw rule.
+
+Two things it will not do. Certificates: `liaxum_crt` and `liaxum_key` are
+created from `traefik/secret/` (override with `CRT_FILE`/`KEY_FILE`), and
+because Docker secrets are immutable, rotating one means removing the secret
+and redeploying Traefik by hand. Joining the mesh: that needs an interactive
+login or a pre-auth key minted inside headscale, so the `mesh` stage stops and
+prints the three commands rather than generating keys on every run.
+
+The stages are `host swarm traefik vpn mesh nfs filebrowser monitor verify`.
+
 ## Bring-up order
+
+The script above runs these for you; they are here for when you want to do it
+by hand or check what a stage actually does.
 
 The order matters: the NFS export must exist, and `monitor-keys` must exist
 inside it, before the Komodo stack is deployed.
