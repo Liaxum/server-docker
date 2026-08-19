@@ -60,7 +60,7 @@ docker exec nfs-server ls -la /shared    # confirm monitor-keys is there
 
 # 2. Filebrowser
 docker stack deploy -c apps/filebrowser/compose.yml files
-docker service logs files_filebrowser   # prints the generated admin password
+docker service logs files_core   # prints the generated admin password
 
 # 3. Komodo
 docker stack deploy -c apps/monitor/compose.yml monitor
