@@ -119,20 +119,34 @@ failed to mount local volume: mount :/shared/monitor-keys:..., data: addr=100.64
 no such file or directory
 ```
 
-This is `NFS4ERR_NOENT` from the server, not a client-side problem — the
-client reached port 2049 and the server replied that the path does not
-resolve. A server that is down gives `connection refused`, and an export that
-rejects the client gives `access denied by server`, so this error means
-`/shared/monitor-keys` is missing from the export:
+This is `NFS4ERR_NOENT` from the server: the client reached port 2049 and the
+server refused to resolve the path. It has **two** causes that look identical,
+because NFSv4 hides an export from a client that does not match its ACL rather
+than reporting a permission error — the lookup just returns ENOENT.
 
-```bash
-docker exec nfs-server ls -la /shared
-docker exec nfs-server mkdir -p /shared/monitor-keys
-docker exec nfs-server chown 1000:1000 /shared/monitor-keys
-```
+1. The directory really is missing from the export:
 
-Swarm does not retry the mount once it has cached the failed volume, so purge
-it (below) and redeploy afterwards.
+   ```bash
+   docker exec nfs-server ls -la /shared
+   ```
+
+   The init sidecar in `apps/nfs/compose.yml` creates it, so this should only
+   happen on a volume predating that service.
+
+2. The client's source address does not match any client spec on the export.
+   The VPS hits this mounting its own export: the request is DNAT'd through
+   the published port, so the server sees the Docker bridge gateway instead of
+   `100.64.0.1`. This is why the export carries a `172.16.0.0/12` spec
+   alongside the Tailscale range. Confirm what the server actually sees with:
+
+   ```bash
+   docker exec nfs-server exportfs -v
+   docker logs --tail 40 nfs-server
+   ```
+
+Swarm re-attempts the mount every time it restarts the task, so once the
+export is right the service recovers on its own; force it with
+`docker service update --force monitor_core` if you would rather not wait.
 
 ### Purge cached NFS volumes across the cluster
 

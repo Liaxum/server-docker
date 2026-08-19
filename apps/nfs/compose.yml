@@ -30,10 +30,20 @@ services:
     volumes:
       - nfs_data:/shared
     environment:
-      # all_squash + anonuid/anongid=1000 maps every remote client (which
-      # connects as root) onto the same UID Filebrowser writes as, so the
-      # GUI and the swarm services can read/write the same files.
-      - "NFS_EXPORT_0=/shared 100.64.0.0/10(rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000)"
+      # Two client specs on one export:
+      #   100.64.0.0/10 - worker nodes reaching us over Tailscale.
+      #   172.16.0.0/12 - the VPS mounting its own export. That request is
+      #     DNAT'd through the published port, so the server sees the Docker
+      #     bridge gateway rather than 100.64.0.1. Without this spec the
+      #     export is invisible to it and NFSv4 answers lookups with
+      #     NFS4ERR_NOENT, which surfaces as "no such file or directory".
+      # Publishing on 100.64.0.1 only means the extra spec is reachable from
+      # this host and its containers, not from the public interface.
+      #
+      # all_squash + anonuid/anongid=1000 maps every client (which connects
+      # as root) onto the same UID Filebrowser writes as, so the GUI and the
+      # swarm services can read/write the same files.
+      - "NFS_EXPORT_0=/shared 100.64.0.0/10(rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000) 172.16.0.0/12(rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000)"
 
 volumes:
   nfs_data:
