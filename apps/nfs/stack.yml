@@ -1,0 +1,31 @@
+services:
+  core:
+    image: filebrowser/filebrowser:latest
+    environment:
+      # This explicitly forces it to create a valid file inside our volume
+      - FB_DATABASE=/database/filebrowser.db
+    volumes:
+      - nfs_data:/srv
+      - config:/database
+    networks:
+      - web-net
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == liaxum-vps
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=web-net"
+        - "traefik.http.routers.files.rule=Host(`files.liaxum.fr`)"
+        - "traefik.http.routers.files.entrypoints=websecure"
+        - "traefik.http.routers.files.tls=true"
+        - "traefik.http.services.files.loadbalancer.server.port=80"
+
+networks:
+  web-net:
+    external: true
+
+volumes:
+  config:
+  nfs_data:
+    external: true

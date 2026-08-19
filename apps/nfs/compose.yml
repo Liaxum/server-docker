@@ -1,0 +1,18 @@
+services:
+  nfs:
+    image: erichough/nfs-server:latest
+    restart: unless-stopped
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - SYS_MODULE
+    ports:
+      - "100.64.0.1:2049:2049"
+    volumes:
+      - nfs_data:/shared
+    environment:
+      - "NFS_EXPORT_0=/shared 100.64.0.0/10(rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000)"
+
+volumes:
+  nfs_data:
+    name: nfs_data
