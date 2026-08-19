@@ -13,8 +13,10 @@ services:
       # Adding a service that needs shared storage means adding its directory
       # here and running `docker compose up -d` -- nothing else.
       SHARED_DIRS: "monitor-keys"
+    # No chown: this container runs as root, so the directories it creates are
+    # already owned by the UID the export squashes to.
     command: >
-      sh -c 'for d in $$SHARED_DIRS; do mkdir -p "/shared/$$d" && chown 1000:1000 "/shared/$$d"; done; chown 1000:1000 /shared'
+      sh -c 'for d in $$SHARED_DIRS; do mkdir -p "/shared/$$d"; done'
     volumes:
       - nfs_data:/shared
 
@@ -50,10 +52,14 @@ services:
       # bridge gateway. The listener is bound to 100.64.0.1, so the second
       # spec is reachable only from this host and its containers.
       #
-      # all_squash + anonuid/anongid=1000 maps every client (which connects
-      # as root) onto the same UID Filebrowser writes as, so the GUI and the
-      # swarm services can read/write the same files.
-      - "NFS_EXPORT_0=/shared 100.64.0.0/10(rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000,fsid=0) 172.16.0.0/12(rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000,fsid=0)"
+      # all_squash + anonuid/anongid=0 maps every client onto root. Containers
+      # already run as root by default, so both access paths -- NFS clients and
+      # Filebrowser binding the volume directly -- agree without depending on
+      # any image's choice of runtime UID.
+      #
+      # Squashing to root lets a client create setuid-root files on the share,
+      # so every client mounts it nosuid,nodev. Nothing here is executed.
+      - "NFS_EXPORT_0=/shared 100.64.0.0/10(rw,sync,no_subtree_check,all_squash,anonuid=0,anongid=0,fsid=0) 172.16.0.0/12(rw,sync,no_subtree_check,all_squash,anonuid=0,anongid=0,fsid=0)"
 
 volumes:
   nfs_data:

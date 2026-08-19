@@ -119,11 +119,27 @@ copying keys around:
 
 ### UID squashing
 
-Filebrowser writes as UID 1000; containers mounting the share connect as root
-(UID 0). Left alone that produces `permission denied` and phantom
-`no such file or directory` errors. The export uses
-`all_squash,anonuid=1000,anongid=1000`, mapping every remote read/write onto
-UID 1000 — no manual `chmod` passes required.
+Two paths reach this storage and they have to agree on ownership:
+
+- **over NFS** (`core`, `agent`) — `all_squash` rewrites every client to
+  `anonuid` regardless of what UID the process runs as in its container, so
+  these services need no configuration at all;
+- **directly** (`filebrowser`) — pinned to the VPS and binding `nfs_data` as a
+  local volume, it never goes through NFS and never gets squashed, so it
+  writes as whatever UID it actually runs as.
+
+Filebrowser is therefore the only writer the export cannot control, and the
+squash target has to match it. Both are set to root: containers default to
+root, so the two agree without depending on any image's choice of runtime UID
+— a `:latest` pull changing that default would otherwise break permissions
+with nothing in this repo having changed. Filebrowser states `user: "0:0"`
+explicitly so the pairing is visible rather than inherited.
+
+The tradeoff is that a client could plant setuid-root files on the share, so
+clients mount `nosuid,nodev`. Note this is not the security boundary: any host
+matching the export's client specs already has full access to every file on
+it, whatever the anon UID. The boundary is the ACL and the Tailscale-bound
+listener.
 
 ### Swarm caches broken volumes
 

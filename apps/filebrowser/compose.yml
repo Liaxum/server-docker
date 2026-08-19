@@ -4,6 +4,10 @@
 services:
   filebrowser:
     image: filebrowser/filebrowser:latest
+    # Stated explicitly rather than inherited from the image: this service
+    # binds nfs_data directly instead of going over NFS, so it is the one
+    # writer the export cannot squash. It has to match anonuid on the export.
+    user: "0:0"
     environment:
       - FB_DATABASE=/database/filebrowser.db
     volumes:
