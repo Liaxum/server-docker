@@ -53,17 +53,16 @@ The order matters: the NFS export must exist, and `monitor-keys` must exist
 inside it, before the Komodo stack is deployed.
 
 ```bash
-# 1. NFS server (standalone compose, VPS only)
+# 1. NFS server (standalone compose, VPS only). Its init sidecar creates
+#    /shared/monitor-keys and fixes ownership before the export goes live.
 docker compose -f apps/nfs/compose.yml up -d
+docker exec nfs-server ls -la /shared    # confirm monitor-keys is there
 
 # 2. Filebrowser
 docker stack deploy -c apps/filebrowser/compose.yml files
 docker service logs files_filebrowser   # prints the generated admin password
 
-# 3. Create the keys directory — via https://files.liaxum.fr, or:
-docker exec nfs-server mkdir -p /shared/monitor-keys
-
-# 4. Komodo
+# 3. Komodo
 docker stack deploy -c apps/monitor/compose.yml monitor
 ```
 
@@ -111,6 +110,29 @@ docker exec -it nfs-server ls -la /shared/monitor-keys
 # From an agent on a worker node — proves the NFS mount actually resolved
 docker exec -it $(docker ps -qf name=monitor_agent) ls -la /config/keys
 ```
+
+### `failed to mount local volume: ... no such file or directory`
+
+```
+starting container failed: error while mounting volume '/var/lib/docker/volumes/monitor_keys/_data':
+failed to mount local volume: mount :/shared/monitor-keys:..., data: addr=100.64.0.1,...:
+no such file or directory
+```
+
+This is `NFS4ERR_NOENT` from the server, not a client-side problem — the
+client reached port 2049 and the server replied that the path does not
+resolve. A server that is down gives `connection refused`, and an export that
+rejects the client gives `access denied by server`, so this error means
+`/shared/monitor-keys` is missing from the export:
+
+```bash
+docker exec nfs-server ls -la /shared
+docker exec nfs-server mkdir -p /shared/monitor-keys
+docker exec nfs-server chown 1000:1000 /shared/monitor-keys
+```
+
+Swarm does not retry the mount once it has cached the failed volume, so purge
+it (below) and redeploy afterwards.
 
 ### Purge cached NFS volumes across the cluster
 

@@ -2,10 +2,23 @@
 # privileges and an AppArmor bypass that swarm services cannot be granted.
 # Deploy on liaxum-vps only:  docker compose -f apps/nfs/compose.yml up -d
 services:
+  # Creates the shared directory tree before the server starts exporting it.
+  # A swarm service that mounts a path missing from the export fails with
+  # NFS4ERR_NOENT and caches a broken stub volume on every node it tried,
+  # so the directories have to exist up front.
+  init:
+    image: busybox:latest
+    command: sh -c "mkdir -p /shared/monitor-keys && chown -R 1000:1000 /shared"
+    volumes:
+      - nfs_data:/shared
+
   nfs:
     image: erichough/nfs-server:latest
     container_name: nfs-server
     restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
     privileged: true
     cap_add:
       - SYS_ADMIN
