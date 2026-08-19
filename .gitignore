@@ -8,4 +8,4 @@ traefik/secret/
 **/.env
 **/*.env
 
-azerothcore-wotlk/
+games/azerothcore-wotlk
