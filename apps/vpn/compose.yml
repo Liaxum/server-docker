@@ -33,7 +33,7 @@ services:
           - node.role == manager
       labels:
         - "traefik.enable=true"
-        - "traefik.http.routers.headscale.rule=Host(`vpn.liaxum.fr`)"
+        - "traefik.http.routers.headscale.rule=Host(`vpn.${DOMAIN:-liaxum.fr}`)"
         - "traefik.http.routers.headscale.entrypoints=websecure"
         - "traefik.http.routers.headscale.tls=true"
         - "traefik.http.routers.headscale.tls.certresolver=letsencrypt"
@@ -51,7 +51,7 @@ services:
       labels:
         - "traefik.enable=true"
         # Access it via a specific subdomain or path
-        - "traefik.http.routers.headplane.rule=Host(`vpn.liaxum.fr`) && PathPrefix(`/admin`)"
+        - "traefik.http.routers.headplane.rule=Host(`vpn.${DOMAIN:-liaxum.fr}`) && PathPrefix(`/admin`)"
         - "traefik.http.routers.headplane.entrypoints=websecure"
         - "traefik.http.routers.headplane.tls=true"
         - "traefik.http.services.headplane.loadbalancer.server.port=3000"

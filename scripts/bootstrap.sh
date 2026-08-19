@@ -8,9 +8,15 @@
 #
 #   ./scripts/bootstrap.sh                      # deploy, host must be ready
 #   ./scripts/bootstrap.sh --with-host-setup    # also prepare the host (sudo)
+#   ./scripts/bootstrap.sh --reconfigure        # re-ask the settings
 #   ./scripts/bootstrap.sh --from nfs           # resume from a stage
 #   ./scripts/bootstrap.sh --only monitor       # run a single stage
 #   ./scripts/bootstrap.sh --dry-run            # print what would run
+#
+# Settings that differ per install -- domain, manager hostname, mesh address,
+# headplane's credentials -- are asked once and kept in bootstrap.env, which is
+# gitignored. Answers are reused on later runs unless --reconfigure is passed;
+# exporting a variable beforehand overrides the stored value.
 #
 # Every stage is idempotent: re-running is always safe.
 
@@ -19,9 +25,13 @@ set -euo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-STAGES=(host swarm traefik vpn mesh nfs filebrowser monitor verify)
+STAGES=(config host swarm traefik vpn mesh nfs filebrowser monitor verify)
+
+# Answers live here. It holds headplane's API key, so keep it out of git.
+ENV_FILE="${ENV_FILE:-bootstrap.env}"
 
 WITH_HOST_SETUP=0
+RECONFIGURE=0
 DRY_RUN=0
 FROM_STAGE=""
 ONLY_STAGE=""
@@ -29,9 +39,6 @@ ONLY_STAGE=""
 # Certificate material for Traefik. Not in the repo -- .gitignore excludes it.
 CRT_FILE="${CRT_FILE:-traefik/secret/liaxum.crt}"
 KEY_FILE="${KEY_FILE:-traefik/secret/liaxum.key}"
-
-# Address headscale assigns this node, which the NFS server binds to.
-MESH_ADDR="${MESH_ADDR:-100.64.0.1}"
 
 # Docker needs this when the host has several addresses and cannot choose.
 SWARM_ADVERTISE_ADDR="${SWARM_ADVERTISE_ADDR:-}"
@@ -67,6 +74,7 @@ config_exists(){ docker config inspect "$1" >/dev/null 2>&1; }
 while (( $# )); do
   case "$1" in
     --with-host-setup) WITH_HOST_SETUP=1 ;;
+    --reconfigure)     RECONFIGURE=1 ;;
     --dry-run)         DRY_RUN=1 ;;
     --from)            FROM_STAGE="${2:?--from needs a stage}"; shift ;;
     --only)            ONLY_STAGE="${2:?--only needs a stage}"; shift ;;
@@ -81,6 +89,105 @@ for s in ${FROM_STAGE:-} ${ONLY_STAGE:-}; do
 done
 
 # ---------------------------------------------------------------- stages ---
+
+# Ask for one setting, or reuse what is already known. Precedence: an exported
+# variable, then bootstrap.env, then the default shown in the prompt.
+ask() {
+  local var="$1" prompt="$2" default="${3:-}" hidden="${4:-}" optional="${5:-}"
+  local current="${!var:-}" reply
+
+  if [[ -n "$current" ]] && (( ! RECONFIGURE )); then
+    export "$var=$current"
+    return
+  fi
+
+  local suggestion="${current:-$default}"
+
+  # Non-interactive: fall back to the suggestion, or fail if there is none.
+  if [[ ! -t 0 ]]; then
+    [[ -n "$suggestion" || -n "$optional" ]] || die "$var is unset and there is no terminal to ask on. Set it in $ENV_FILE or export it."
+    export "$var=$suggestion"
+    return
+  fi
+
+  if [[ -n "$hidden" ]]; then
+    read -rsp "    $prompt: " reply; printf '\n'
+  elif [[ -n "$suggestion" ]]; then
+    read -rp "    $prompt [$suggestion]: " reply
+  else
+    read -rp "    $prompt: " reply
+  fi
+
+  reply="${reply:-$suggestion}"
+  [[ -n "$reply" || -n "$optional" ]] || die "$var cannot be empty"
+  export "$var=$reply"
+}
+
+# Substitute the settings into a *.template file. Deliberately not envsubst:
+# gettext is not installed everywhere, and the placeholder set is fixed.
+render() {
+  local template="$1" out="${1%.template}"
+  (( DRY_RUN )) && { printf '    would render: %s -> %s\n' "$template" "$out"; return; }
+  sed -e "s|\${DOMAIN}|$DOMAIN|g" \
+      -e "s|\${MANAGER_HOSTNAME}|$MANAGER_HOSTNAME|g" \
+      -e "s|\${MESH_ADDR}|$MESH_ADDR|g" \
+      -e "s|\${HEADPLANE_API_KEY}|$HEADPLANE_API_KEY|g" \
+      -e "s|\${HEADPLANE_COOKIE_SECRET}|$HEADPLANE_COOKIE_SECRET|g" \
+      "$template" > "$out"
+  ok "rendered $out"
+}
+
+# Pull in stored answers. Runs before any stage, so --only/--from still see
+# the settings without re-running the config stage.
+load_env() {
+  # shellcheck source=/dev/null
+  [[ -f "$ENV_FILE" ]] && { set -a; source "$ENV_FILE"; set +a; }
+  return 0
+}
+
+# Stages that interpolate settings into compose files or rendered configs need
+# real values; without them Compose would quietly fall back to its defaults and
+# deploy someone else's domain.
+require_settings() {
+  local v
+  for v in DOMAIN MANAGER_HOSTNAME MESH_ADDR; do
+    [[ -n "${!v:-}" ]] || die "$v is not set. Run '$0 --only config' first, or export it."
+    export "$v=${!v}"
+  done
+  export HEADPLANE_API_KEY="${HEADPLANE_API_KEY:-}"
+  export HEADPLANE_COOKIE_SECRET="${HEADPLANE_COOKIE_SECRET:-}"
+}
+
+stage_config() {
+  info "settings"
+  [[ -f "$ENV_FILE" ]] && skip "loaded $ENV_FILE"
+
+  ask DOMAIN           "Domain serving the stacks"       "liaxum.fr"
+  ask MANAGER_HOSTNAME "Hostname of the manager node"    "$(hostname)"
+  ask MESH_ADDR        "This node's address on the mesh" "100.64.0.1"
+
+  # Minted in headplane; see its docs. Left empty until headscale exists, so a
+  # first run can get as far as deploying headscale and come back to it.
+  ask HEADPLANE_API_KEY       "Headplane API key (blank to fill in later)" "" "" optional
+  ask HEADPLANE_COOKIE_SECRET "Headplane cookie secret" "$(openssl rand -hex 16 2>/dev/null || head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+
+  if (( DRY_RUN )); then
+    skip "would write $ENV_FILE"
+  else
+    umask 077
+    cat > "$ENV_FILE" <<EOF
+# Written by scripts/bootstrap.sh. Gitignored: contains credentials.
+DOMAIN=$DOMAIN
+MANAGER_HOSTNAME=$MANAGER_HOSTNAME
+MESH_ADDR=$MESH_ADDR
+HEADPLANE_API_KEY=$HEADPLANE_API_KEY
+HEADPLANE_COOKIE_SECRET=$HEADPLANE_COOKIE_SECRET
+EOF
+    ok "saved $ENV_FILE"
+  fi
+
+  printf '    %s -> %s, manager %s, mesh %s\n' "stacks" "*.$DOMAIN" "$MANAGER_HOSTNAME" "$MESH_ADDR"
+}
 
 stage_host() {
   if (( ! WITH_HOST_SETUP )); then
@@ -173,9 +280,16 @@ stage_swarm() {
 }
 
 stage_traefik()     { info "traefik";     run docker stack deploy -c traefik/compose.yml traefik; }
-stage_vpn()         { info "headscale";   run docker stack deploy -c apps/vpn/compose.yml vpn; }
 stage_filebrowser() { info "filebrowser"; run docker stack deploy -c apps/filebrowser/compose.yml files; }
 stage_monitor()     { info "komodo";      run docker stack deploy -c apps/monitor/compose.yml monitor; }
+
+stage_vpn() {
+  info "headscale"
+  # compose reads these as files, so they are rendered rather than interpolated
+  render apps/vpn/config.yaml.template
+  render apps/vpn/headplane_config.yaml.template
+  run docker stack deploy -c apps/vpn/compose.yml vpn
+}
 
 stage_mesh() {
   info "mesh address"
@@ -197,9 +311,9 @@ stage_mesh() {
 This host does not hold $MESH_ADDR yet, so the NFS server cannot bind it.
 Join the mesh, then re-run with: $0 --from nfs
 
-  docker exec headscale headscale users create liaxum
-  docker exec headscale headscale preauthkeys create --user liaxum --reusable --expiration 1h
-  sudo tailscale up --login-server https://vpn.liaxum.fr --authkey <key>
+  docker exec headscale headscale users create \$USER
+  docker exec headscale headscale preauthkeys create --user \$USER --reusable --expiration 1h
+  sudo tailscale up --login-server https://vpn.$DOMAIN --authkey <key>
 
 EOF
   die "not joined to the mesh"
@@ -248,14 +362,16 @@ stage_verify() {
 
 $(printf '%s' "$GREEN")All services are up.$(printf '%s' "$OFF")
 
-  headscale   https://vpn.liaxum.fr          admin at /admin
-  filebrowser https://files.liaxum.fr        password: docker service logs files_core
-  komodo      https://monitor.liaxum.fr
+  headscale   https://vpn.$DOMAIN          admin at /admin
+  filebrowser https://files.$DOMAIN        password: docker service logs files_core
+  komodo      https://monitor.$DOMAIN
 
 EOF
 }
 
 # ------------------------------------------------------------------ main ---
+
+load_env
 
 started=0
 for stage in "${STAGES[@]}"; do
@@ -265,5 +381,9 @@ for stage in "${STAGES[@]}"; do
     [[ "$stage" == "$FROM_STAGE" ]] || continue
     started=1
   fi
+  case "$stage" in
+    config|host) ;;
+    *)           require_settings ;;
+  esac
   "stage_$stage"
 done

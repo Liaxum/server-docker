@@ -1,6 +1,6 @@
 # Standalone compose (NOT a swarm stack): the kernel NFS server needs host
 # privileges and an AppArmor bypass that swarm services cannot be granted.
-# Deploy on liaxum-vps only:  docker compose -f apps/nfs/compose.yml up -d
+# Deploy on the manager node only:  docker compose -f apps/nfs/compose.yml up -d
 services:
   # Creates the shared directory tree before the server starts exporting it.
   # A swarm service that mounts a path missing from the export fails with
@@ -34,7 +34,7 @@ services:
     ports:
       # Bound to the Tailscale IP so the export is never reachable from the
       # public interface.
-      - "100.64.0.1:2049:2049"
+      - "${MESH_ADDR:-100.64.0.1}:2049:2049"
     volumes:
       - nfs_data:/shared
     environment:

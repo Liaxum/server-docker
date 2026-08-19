@@ -15,7 +15,7 @@ services:
     deploy:
       placement:
         constraints:
-          - node.hostname == liaxum-vps
+          - node.hostname == ${MANAGER_HOSTNAME:-liaxum-vps}
 
   core:
     image: ghcr.io/moghtech/komodo-core:2
@@ -32,11 +32,11 @@ services:
     deploy:
       placement:
         constraints:
-          - node.hostname == liaxum-vps
+          - node.hostname == ${MANAGER_HOSTNAME:-liaxum-vps}
       labels:
         - "traefik.enable=true"
         - "traefik.swarm.network=web-net"
-        - "traefik.http.routers.komodo.rule=Host(`monitor.liaxum.fr`)"
+        - "traefik.http.routers.komodo.rule=Host(`monitor.${DOMAIN:-liaxum.fr}`)"
         - "traefik.http.routers.komodo.entrypoints=websecure"
         - "traefik.http.routers.komodo.tls=true"
         - "traefik.http.services.komodo.loadbalancer.server.port=9120"
@@ -44,7 +44,7 @@ services:
   agent:
     image: ghcr.io/moghtech/komodo-periphery:2
     environment:
-      - PERIPHERY_CORE_ADDRESS=wss://monitor.liaxum.fr
+      - PERIPHERY_CORE_ADDRESS=wss://monitor.${DOMAIN:-liaxum.fr}
       - PERIPHERY_CONNECT_AS={{ .Node.Hostname }}
       - PERIPHERY_CORE_PUBLIC_KEYS=file:/config/keys/core.pub
       - PERIPHERY_ONBOARDING_KEY=O_MtvPL47OpYgEqArluFsbv6nXjR0U_O
@@ -60,7 +60,7 @@ services:
   mcp:
     image: ghcr.io/myrikld/komodo-mcp:latest
     environment:
-      - KOMODO_MCP_KOMODO_URL=https://monitor.liaxum.fr
+      - KOMODO_MCP_KOMODO_URL=https://monitor.${DOMAIN:-liaxum.fr}
       - KOMODO_MCP_KOMODO_API_KEY=K_d7XqOnTpGduUmUH74C7t8iwhhCgYN4qqgczNGN64_K
       - KOMODO_MCP_KOMODO_API_SECRET=S_7nqRoUAZtzENIX0slKeb2siVleJfUg1j7beWUTmM_S
     networks:
@@ -70,12 +70,12 @@ services:
       replicas: 1
       placement:
         constraints:
-          - node.hostname == liaxum-vps
+          - node.hostname == ${MANAGER_HOSTNAME:-liaxum-vps}
       labels:
         - "traefik.enable=true"
         - "traefik.swarm.network=web-net"
         # We will expose this on a separate subdomain for the AI
-        - "traefik.http.routers.komodomcp.rule=Host(`mcp.liaxum.fr`)"
+        - "traefik.http.routers.komodomcp.rule=Host(`mcp.${DOMAIN:-liaxum.fr}`)"
         - "traefik.http.routers.komodomcp.entrypoints=websecure"
         - "traefik.http.routers.komodomcp.tls=true"
         - "traefik.http.services.komodomcp.loadbalancer.server.port=8000"
@@ -94,7 +94,7 @@ volumes:
     driver: local
     driver_opts:
       type: "nfs"
-      o: "addr=100.64.0.1,rw,nfsvers=4,nolock,soft,nosuid,nodev"
+      o: "addr=${MESH_ADDR:-100.64.0.1},rw,nfsvers=4,nolock,soft,nosuid,nodev"
       # Path is relative to the NFSv4 root, which the export pins to /shared
       # with fsid=0 -- so this is /shared/monitor-keys on the server.
       device: ":/monitor-keys"

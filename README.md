@@ -64,6 +64,28 @@ prerequisites and stops with the exact command to run if one is missing. With
 it, it installs the NFS client utilities, initialises the swarm, creates
 `/opt/vpn/data` and adds the ufw rule.
 
+### Settings
+
+The first run asks for the values that differ per install and stores them in
+`bootstrap.env`, which is gitignored because it holds credentials. Later runs
+reuse the answers; `--reconfigure` asks again, and exporting a variable
+beforehand overrides the stored value.
+
+| | |
+|---|---|
+| `DOMAIN` | serves `vpn.`, `files.`, `monitor.`, `mcp.` |
+| `MANAGER_HOSTNAME` | the `node.hostname ==` placement constraint |
+| `MESH_ADDR` | this node's mesh address; the NFS server binds it |
+| `HEADPLANE_API_KEY` | minted in headplane, so blank on a first run |
+| `HEADPLANE_COOKIE_SECRET` | generated if you accept the default |
+
+These reach the stacks two different ways. Compose files use `${DOMAIN:-…}`
+interpolation, so a manual `docker stack deploy` still works and falls back to
+the committed defaults. Headscale's `config.yaml` and `headplane_config.yaml`
+are mounted as Docker configs, and Compose never interpolates *file contents* —
+so those are tracked as `.template` files and rendered by the `vpn` stage. The
+rendered files are gitignored; edit the template, not the output.
+
 Two things it will not do. Certificates: `liaxum_crt` and `liaxum_key` are
 created from `traefik/secret/` (override with `CRT_FILE`/`KEY_FILE`), and
 because Docker secrets are immutable, rotating one means removing the secret
