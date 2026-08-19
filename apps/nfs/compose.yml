@@ -1,0 +1,28 @@
+# Standalone compose (NOT a swarm stack): the kernel NFS server needs host
+# privileges and an AppArmor bypass that swarm services cannot be granted.
+# Deploy on liaxum-vps only:  docker compose -f apps/nfs/compose.yml up -d
+services:
+  nfs:
+    image: erichough/nfs-server:latest
+    container_name: nfs-server
+    restart: unless-stopped
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - SYS_MODULE
+    ports:
+      # Bound to the Tailscale IP so the export is never reachable from the
+      # public interface.
+      - "100.64.0.1:2049:2049"
+    volumes:
+      - nfs_data:/shared
+    environment:
+      # all_squash + anonuid/anongid=1000 maps every remote client (which
+      # connects as root) onto the same UID Filebrowser writes as, so the
+      # GUI and the swarm services can read/write the same files.
+      - "NFS_EXPORT_0=/shared 100.64.0.0/10(rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000)"
+
+volumes:
+  nfs_data:
+    # Fixed name so other stacks can reference it as an external volume.
+    name: nfs_data

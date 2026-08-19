@@ -1,5 +1,11 @@
+# docker stack deploy -c apps/monitor/compose.yml monitor
+#
+# The `agent` service runs globally, so periphery instances land on remote
+# hardware that cannot see core's local /config/keys. The `keys` volume is
+# therefore an NFS mount of /shared/monitor-keys exported by apps/nfs over
+# Tailscale, which is how the agents pick up the core.pub that core writes.
 services:
-  mongo:
+  db:
     image: mongo:6
     volumes:
       - mongo-data:/data/db
@@ -14,7 +20,7 @@ services:
   core:
     image: ghcr.io/moghtech/komodo-core:2
     environment:
-      - KOMODO_DATABASE_ADDRESS=mongo:27017
+      - KOMODO_DATABASE_ADDRESS=db:27017
       - KOMODO_JWT_SECRET=super_secret_jwt_12345
       - KOMODO_WEBHOOK_SECRET=super_secret_webhook_12345
       - KOMODO_LOCAL_AUTH=true
@@ -35,13 +41,13 @@ services:
         - "traefik.http.routers.komodo.tls=true"
         - "traefik.http.services.komodo.loadbalancer.server.port=9120"
 
-  periphery:
+  agent:
     image: ghcr.io/moghtech/komodo-periphery:2
     environment:
       - PERIPHERY_CORE_ADDRESS=wss://monitor.liaxum.fr
       - PERIPHERY_CONNECT_AS={{ .Node.Hostname }}
       - PERIPHERY_CORE_PUBLIC_KEYS=file:/config/keys/core.pub
-      - PERIPHERY_ONBOARDING_KEY=O_CBCRBSTQ3eKKROtQdXMICDCd1NLM_O
+      - PERIPHERY_ONBOARDING_KEY=O_MtvPL47OpYgEqArluFsbv6nXjR0U_O
     volumes:
       - keys:/config/keys
       - /var/run/docker.sock:/var/run/docker.sock
@@ -50,7 +56,7 @@ services:
       - komodo-net
     deploy:
       mode: global
-  
+
   mcp:
     image: ghcr.io/myrikld/komodo-mcp:latest
     environment:
@@ -85,3 +91,10 @@ volumes:
   mongo-data:
   mongo-config:
   keys:
+    driver: local
+    driver_opts:
+      type: "nfs"
+      o: "addr=100.64.0.1,rw,nfsvers=4,nolock,soft"
+      # /shared/monitor-keys must exist on the NFS server before deploying,
+      # otherwise every node caches a broken stub volume.
+      device: ":/shared/monitor-keys"
