@@ -7,3 +7,5 @@
 traefik/secret/
 **/.env
 **/*.env
+
+azerothcore-wotlk/
