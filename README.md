@@ -66,6 +66,42 @@ docker service logs files_filebrowser   # prints the generated admin password
 docker stack deploy -c apps/monitor/compose.yml monitor
 ```
 
+## Adding a service that needs shared storage
+
+Two edits, no host access.
+
+1. Add the directory to `SHARED_DIRS` in `apps/nfs/compose.yml`, space
+   separated, and apply it:
+
+   ```bash
+   docker compose -f apps/nfs/compose.yml up -d
+   ```
+
+   The init sidecar creates anything listed and is idempotent, so existing
+   directories are untouched.
+
+2. Declare the volume in the new stack. The path is relative to the NFSv4
+   root, which `fsid=0` pins to `/shared` — so a directory named `foo-data`
+   is `:/foo-data`, not `:/shared/foo-data`:
+
+   ```yaml
+   volumes:
+     data:
+       driver: local
+       driver_opts:
+         type: "nfs"
+         o: "addr=100.64.0.1,rw,nfsvers=4,nolock,soft"
+         device: ":/foo-data"
+   ```
+
+The export itself needs no change — it covers the whole tree, and `all_squash`
+maps every client onto UID 1000 regardless of what UID the service runs as
+inside its container, so there is no per-service ownership setup.
+
+If you later change a volume's `device` or `o` options, remember Docker pins
+`driver_opts` at volume creation: the volume must be removed on every node
+before the new options take effect.
+
 ## Design decisions
 
 ### Hybrid local + NFS volume model

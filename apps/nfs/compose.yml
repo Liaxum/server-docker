@@ -8,7 +8,13 @@ services:
   # so the directories have to exist up front.
   init:
     image: busybox:latest
-    command: sh -c "mkdir -p /shared/monitor-keys && chown -R 1000:1000 /shared"
+    environment:
+      # Every directory a stack mounts out of this export, space separated.
+      # Adding a service that needs shared storage means adding its directory
+      # here and running `docker compose up -d` -- nothing else.
+      SHARED_DIRS: "monitor-keys"
+    command: >
+      sh -c 'for d in $$SHARED_DIRS; do mkdir -p "/shared/$$d" && chown 1000:1000 "/shared/$$d"; done; chown 1000:1000 /shared'
     volumes:
       - nfs_data:/shared
 
