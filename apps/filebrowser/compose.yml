@@ -1,0 +1,38 @@
+# docker stack deploy -c apps/filebrowser/compose.yml files
+# Pinned to the VPS so it can bind the local nfs_data volume directly
+# (no NFS round-trip) and manage the shared tree from the web UI.
+services:
+  core:
+    image: filebrowser/filebrowser:latest
+    # Stated explicitly rather than inherited from the image: this service
+    # binds nfs_data directly instead of going over NFS, so it is the one
+    # writer the export cannot squash. It has to match anonuid on the export.
+    user: "0:0"
+    environment:
+      - FB_DATABASE=/database/filebrowser.db
+    volumes:
+      - nfs_data:/srv
+      - config:/database
+    networks:
+      - web-net
+    deploy:
+      placement:
+        constraints:
+          - node.hostname == liaxum-vps
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=web-net"
+        - "traefik.http.routers.files.rule=Host(`files.liaxum.fr`)"
+        - "traefik.http.routers.files.entrypoints=websecure"
+        - "traefik.http.routers.files.tls=true"
+        - "traefik.http.services.files.loadbalancer.server.port=80"
+
+networks:
+  web-net:
+    external: true
+
+volumes:
+  config:
+  nfs_data:
+    # Created by apps/nfs/compose.yml on liaxum-vps.
+    external: true

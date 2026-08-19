@@ -1,3 +1,9 @@
+# docker stack deploy -c apps/monitor/compose.yml monitor
+#
+# The `agent` service runs globally, so periphery instances land on remote
+# hardware that cannot see core's local /config/keys. The `keys` volume is
+# therefore an NFS mount of /shared/monitor-keys exported by apps/nfs over
+# Tailscale, which is how the agents pick up the core.pub that core writes.
 services:
   db:
     image: mongo:6
@@ -50,7 +56,7 @@ services:
       - komodo-net
     deploy:
       mode: global
-  
+
   mcp:
     image: ghcr.io/myrikld/komodo-mcp:latest
     environment:
@@ -88,7 +94,7 @@ volumes:
     driver: local
     driver_opts:
       type: "nfs"
-      # Put your VPS Tailscale IP here!
-      o: "addr=100.64.0.1,rw,nfsvers=4,nolock,soft"
-      # Points directly to the folder you made in Filebrowser!
-      device: ":/shared/monitor-keys"
+      o: "addr=100.64.0.1,rw,nfsvers=4,nolock,soft,nosuid,nodev"
+      # Path is relative to the NFSv4 root, which the export pins to /shared
+      # with fsid=0 -- so this is /shared/monitor-keys on the server.
+      device: ":/monitor-keys"

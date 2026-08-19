@@ -1,18 +1,67 @@
+# Standalone compose (NOT a swarm stack): the kernel NFS server needs host
+# privileges and an AppArmor bypass that swarm services cannot be granted.
+# Deploy on liaxum-vps only:  docker compose -f apps/nfs/compose.yml up -d
 services:
-  nfs:
+  # Creates the shared directory tree before the server starts exporting it.
+  # A swarm service that mounts a path missing from the export fails with
+  # NFS4ERR_NOENT and caches a broken stub volume on every node it tried,
+  # so the directories have to exist up front.
+  init:
+    image: busybox:latest
+    environment:
+      # Every directory a stack mounts out of this export, space separated.
+      # Adding a service that needs shared storage means adding its directory
+      # here and running `docker compose up -d` -- nothing else.
+      SHARED_DIRS: "monitor-keys"
+    # No chown: this container runs as root, so the directories it creates are
+    # already owned by the UID the export squashes to.
+    command: >
+      sh -c 'for d in $$SHARED_DIRS; do mkdir -p "/shared/$$d"; done'
+    volumes:
+      - nfs_data:/shared
+
+  core:
     image: erichough/nfs-server:latest
+    container_name: nfs-server
     restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
     privileged: true
     cap_add:
       - SYS_ADMIN
       - SYS_MODULE
     ports:
+      # Bound to the Tailscale IP so the export is never reachable from the
+      # public interface.
       - "100.64.0.1:2049:2049"
     volumes:
       - nfs_data:/shared
     environment:
-      - "NFS_EXPORT_0=/shared 100.64.0.0/10(rw,sync,no_subtree_check,all_squash,anonuid=1000,anongid=1000)"
+      # fsid=0 makes /shared the NFSv4 root. It is a bind-mounted Docker
+      # volume, so it lives in this container's mount namespace and nfsd
+      # cannot build a pseudo-filesystem that reaches it -- without fsid=0
+      # the server has no v4 root at all and answers every lookup, even of
+      # "/", with NFS4ERR_NOENT ("no such file or directory"). Because
+      # /shared IS the root, clients address paths relative to it:
+      # /shared/monitor-keys on the server is :/monitor-keys to a client.
+      #
+      # Two client specs: 100.64.0.0/10 for worker nodes arriving over
+      # Tailscale, 172.16.0.0/12 for the VPS mounting its own export through
+      # the published port, where the source address is NAT'd to the Docker
+      # bridge gateway. The listener is bound to 100.64.0.1, so the second
+      # spec is reachable only from this host and its containers.
+      #
+      # all_squash + anonuid/anongid=0 maps every client onto root. Containers
+      # already run as root by default, so both access paths -- NFS clients and
+      # Filebrowser binding the volume directly -- agree without depending on
+      # any image's choice of runtime UID.
+      #
+      # Squashing to root lets a client create setuid-root files on the share,
+      # so every client mounts it nosuid,nodev. Nothing here is executed.
+      - "NFS_EXPORT_0=/shared 100.64.0.0/10(rw,sync,no_subtree_check,all_squash,anonuid=0,anongid=0,fsid=0) 172.16.0.0/12(rw,sync,no_subtree_check,all_squash,anonuid=0,anongid=0,fsid=0)"
 
 volumes:
   nfs_data:
+    # Fixed name so other stacks can reference it as an external volume.
     name: nfs_data
