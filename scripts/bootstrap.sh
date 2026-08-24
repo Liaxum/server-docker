@@ -361,9 +361,18 @@ check_cert_pair() {
   b="$(openssl pkey -in "$KEY_FILE" -pubout 2>/dev/null)"
   [[ "$a" == "$b" ]] || die "$CRT_FILE and $KEY_FILE are not a pair: the certificate's public key does not match the private key"
 
+  # A leaf without its intermediates verifies in browsers, which fetch or cache
+  # them, and fails in Go -- so tailscale cannot reach headscale and retries
+  # forever, which reads as the command hanging.
+  local certs
+  certs="$(grep -c -- '-----BEGIN CERTIFICATE-----' "$CRT_FILE" 2>/dev/null || echo 0)"
+  if [[ "$certs" -le 1 ]]; then
+    warn "$CRT_FILE holds a single certificate, so the intermediate chain is missing. Browsers usually cope; Go clients (tailscale, and anything else dialling these hosts) do not. Concatenate the CA's intermediates after the leaf: cat leaf.cer intermediate.cer > fullchain.pem"
+  fi
+
   local expiry
   expiry="$(openssl x509 -in "$CRT_FILE" -noout -enddate 2>/dev/null)" || true
-  ok "certificate ok (${expiry#notAfter=})"
+  ok "certificate ok, $certs in chain (${expiry#notAfter=})"
 }
 
 # A precondition this run cannot meet. Fatal normally; under --dry-run it is
