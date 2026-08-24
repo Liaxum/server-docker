@@ -77,8 +77,16 @@ beforehand overrides the stored value.
 | `MANAGER_HOSTNAME` | the `node.hostname ==` placement constraint |
 | `MESH_ADDR` | this node's mesh address; the NFS server binds it |
 | `MESH_CIDR` | range headscale hands out **and** the NFS export admits |
+| `*_STACK` | stack names: `TRAEFIK_`, `VPN_`, `FILES_`, `MONITOR_` |
+| `*_SUBDOMAIN` | subdomains: `VPN_`, `FILES_`, `MONITOR_`, `MCP_` |
 | `HEADPLANE_API_KEY` | minted in headplane, so blank on a first run |
 | `HEADPLANE_COOKIE_SECRET` | generated if you accept the default |
+
+Service names are deliberately absent. They are YAML keys, and Compose does
+not interpolate keys — parameterising them would mean generating every compose
+file, which costs more than it buys. Every stack here calls its main service
+`core` by repo convention, so a renamed stack still resolves as
+`<stack>_core`; headplane's reference to headscale is rendered that way.
 
 `MESH_CIDR` lands in two places that have to agree: headscale's
 `prefixes.v4`, which decides what addresses exist, and the NFS export's client

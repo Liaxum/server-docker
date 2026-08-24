@@ -146,6 +146,8 @@ render() {
       -e "s|\${MANAGER_HOSTNAME}|$MANAGER_HOSTNAME|g" \
       -e "s|\${MESH_ADDR}|$MESH_ADDR|g" \
       -e "s|\${MESH_CIDR}|$MESH_CIDR|g" \
+      -e "s|\${VPN_STACK}|$VPN_STACK|g" \
+      -e "s|\${VPN_SUBDOMAIN}|$VPN_SUBDOMAIN|g" \
       -e "s|\${HEADPLANE_API_KEY}|$HEADPLANE_API_KEY|g" \
       -e "s|\${HEADPLANE_COOKIE_SECRET}|$HEADPLANE_COOKIE_SECRET|g" \
       "$template" > "$out"
@@ -172,7 +174,9 @@ load_env() {
 # deploy someone else's domain.
 require_settings() {
   local v
-  for v in DOMAIN MANAGER_HOSTNAME MESH_ADDR MESH_CIDR; do
+  for v in DOMAIN MANAGER_HOSTNAME MESH_ADDR MESH_CIDR \
+           TRAEFIK_STACK VPN_STACK VPN_SUBDOMAIN FILES_STACK FILES_SUBDOMAIN \
+           MONITOR_STACK MONITOR_SUBDOMAIN MCP_SUBDOMAIN; do
     [[ -n "${!v:-}" ]] || die "$v is not set. Run '$0 --only config' first, or export it."
     export "$v=${!v}"
   done
@@ -197,6 +201,18 @@ stage_config() {
 
   # Minted in headplane; see its docs. Left empty until headscale exists, so a
   # first run can get as far as deploying headscale and come back to it.
+  # Stack names are docker stack deploy arguments, so they are free to change.
+  # Service names are not: they are YAML keys, and Compose does not interpolate
+  # keys -- every stack here calls its main service "core" by repo convention.
+  ask TRAEFIK_STACK      "Stack name for traefik"      "traefik"
+  ask VPN_STACK          "Stack name for headscale"    "vpn"
+  ask VPN_SUBDOMAIN      "Subdomain for headscale"     "vpn"
+  ask FILES_STACK        "Stack name for filebrowser"  "files"
+  ask FILES_SUBDOMAIN    "Subdomain for filebrowser"   "files"
+  ask MONITOR_STACK      "Stack name for komodo"       "monitor"
+  ask MONITOR_SUBDOMAIN  "Subdomain for komodo"        "monitor"
+  ask MCP_SUBDOMAIN      "Subdomain for the komodo MCP server" "mcp"
+
   ask HEADPLANE_API_KEY       "Headplane API key (blank to fill in later)" "" "" optional
   ask HEADPLANE_COOKIE_SECRET "Headplane cookie secret" "$(openssl rand -hex 16 2>/dev/null || head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
@@ -210,13 +226,22 @@ DOMAIN=$DOMAIN
 MANAGER_HOSTNAME=$MANAGER_HOSTNAME
 MESH_ADDR=$MESH_ADDR
 MESH_CIDR=$MESH_CIDR
+TRAEFIK_STACK=$TRAEFIK_STACK
+VPN_STACK=$VPN_STACK
+VPN_SUBDOMAIN=$VPN_SUBDOMAIN
+FILES_STACK=$FILES_STACK
+FILES_SUBDOMAIN=$FILES_SUBDOMAIN
+MONITOR_STACK=$MONITOR_STACK
+MONITOR_SUBDOMAIN=$MONITOR_SUBDOMAIN
+MCP_SUBDOMAIN=$MCP_SUBDOMAIN
 HEADPLANE_API_KEY=$HEADPLANE_API_KEY
 HEADPLANE_COOKIE_SECRET=$HEADPLANE_COOKIE_SECRET
 EOF
     ok "saved $ENV_FILE"
   fi
 
-  printf '    %s -> %s, manager %s, mesh %s\n' "stacks" "*.$DOMAIN" "$MANAGER_HOSTNAME" "$MESH_ADDR"
+  printf '    %s, manager %s, mesh %s in %s\n' "*.$DOMAIN" "$MANAGER_HOSTNAME" "$MESH_ADDR" "$MESH_CIDR"
+  printf '    stacks: %s %s %s %s\n' "$TRAEFIK_STACK" "$VPN_STACK" "$FILES_STACK" "$MONITOR_STACK"
 }
 
 stage_host() {
@@ -309,16 +334,16 @@ stage_swarm() {
   ok "swarm resources ready"
 }
 
-stage_traefik()     { info "traefik";     run docker stack deploy -c traefik/compose.yml traefik; }
-stage_filebrowser() { info "filebrowser"; run docker stack deploy -c apps/filebrowser/compose.yml files; }
-stage_monitor()     { info "komodo";      run docker stack deploy -c apps/monitor/compose.yml monitor; }
+stage_traefik()     { info "traefik";     run docker stack deploy -c traefik/compose.yml "$TRAEFIK_STACK"; }
+stage_filebrowser() { info "filebrowser"; run docker stack deploy -c apps/filebrowser/compose.yml "$FILES_STACK"; }
+stage_monitor()     { info "komodo";      run docker stack deploy -c apps/monitor/compose.yml "$MONITOR_STACK"; }
 
 stage_vpn() {
   info "headscale"
   # compose reads these as files, so they are rendered rather than interpolated
   render apps/vpn/config.yaml.template
   render apps/vpn/headplane_config.yaml.template
-  run docker stack deploy -c apps/vpn/compose.yml vpn
+  run docker stack deploy -c apps/vpn/compose.yml "$VPN_STACK"
 }
 
 stage_mesh() {
@@ -343,7 +368,7 @@ Join the mesh, then re-run with: $0 --from nfs
 
   docker exec headscale headscale users create \$USER
   docker exec headscale headscale preauthkeys create --user \$USER --reusable --expiration 1h
-  sudo tailscale up --login-server https://vpn.$DOMAIN --authkey <key>
+  sudo tailscale up --login-server https://$VPN_SUBDOMAIN.$DOMAIN --authkey <key>
 
 EOF
   die "not joined to the mesh"
@@ -366,7 +391,9 @@ stage_verify() {
   fi
 
   local failed=0 svc replicas
-  for svc in traefik_core vpn_core vpn_web files_core monitor_db monitor_core monitor_agent monitor_mcp; do
+  for svc in "${TRAEFIK_STACK}_core" "${VPN_STACK}_core" "${VPN_STACK}_web" \
+             "${FILES_STACK}_core" "${MONITOR_STACK}_db" "${MONITOR_STACK}_core" \
+             "${MONITOR_STACK}_agent" "${MONITOR_STACK}_mcp"; do
     replicas="$(docker service ls --filter "name=$svc" --format '{{.Replicas}}' 2>/dev/null | head -1)"
     if [[ -z "$replicas" ]]; then
       warn "$svc: not deployed"
@@ -392,9 +419,9 @@ stage_verify() {
 
 $(printf '%s' "$GREEN")All services are up.$(printf '%s' "$OFF")
 
-  headscale   https://vpn.$DOMAIN          admin at /admin
-  filebrowser https://files.$DOMAIN        password: docker service logs files_core
-  komodo      https://monitor.$DOMAIN
+  headscale   https://$VPN_SUBDOMAIN.$DOMAIN     admin at /admin
+  filebrowser https://$FILES_SUBDOMAIN.$DOMAIN     password: docker service logs ${FILES_STACK}_core
+  komodo      https://$MONITOR_SUBDOMAIN.$DOMAIN
 
 EOF
 }

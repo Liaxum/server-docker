@@ -1,6 +1,6 @@
 headscale:
-  url: "http://vpn_core:8080"
-  public_url: "https://vpn.${DOMAIN}"
+  url: "http://${VPN_STACK}_core:8080"
+  public_url: "https://${VPN_SUBDOMAIN}.${DOMAIN}"
   api_key: "${HEADPLANE_API_KEY}"
 server:
   cookie_secret: "${HEADPLANE_COOKIE_SECRET}"

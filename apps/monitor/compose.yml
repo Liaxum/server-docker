@@ -36,7 +36,7 @@ services:
       labels:
         - "traefik.enable=true"
         - "traefik.swarm.network=web-net"
-        - "traefik.http.routers.komodo.rule=Host(`monitor.${DOMAIN:-liaxum.fr}`)"
+        - "traefik.http.routers.komodo.rule=Host(`${MONITOR_SUBDOMAIN:-monitor}.${DOMAIN:-liaxum.fr}`)"
         - "traefik.http.routers.komodo.entrypoints=websecure"
         - "traefik.http.routers.komodo.tls=true"
         - "traefik.http.services.komodo.loadbalancer.server.port=9120"
@@ -44,7 +44,7 @@ services:
   agent:
     image: ghcr.io/moghtech/komodo-periphery:2
     environment:
-      - PERIPHERY_CORE_ADDRESS=wss://monitor.${DOMAIN:-liaxum.fr}
+      - PERIPHERY_CORE_ADDRESS=wss://${MONITOR_SUBDOMAIN:-monitor}.${DOMAIN:-liaxum.fr}
       - PERIPHERY_CONNECT_AS={{ .Node.Hostname }}
       - PERIPHERY_CORE_PUBLIC_KEYS=file:/config/keys/core.pub
       - PERIPHERY_ONBOARDING_KEY=O_MtvPL47OpYgEqArluFsbv6nXjR0U_O
@@ -60,7 +60,7 @@ services:
   mcp:
     image: ghcr.io/myrikld/komodo-mcp:latest
     environment:
-      - KOMODO_MCP_KOMODO_URL=https://monitor.${DOMAIN:-liaxum.fr}
+      - KOMODO_MCP_KOMODO_URL=https://${MONITOR_SUBDOMAIN:-monitor}.${DOMAIN:-liaxum.fr}
       - KOMODO_MCP_KOMODO_API_KEY=K_d7XqOnTpGduUmUH74C7t8iwhhCgYN4qqgczNGN64_K
       - KOMODO_MCP_KOMODO_API_SECRET=S_7nqRoUAZtzENIX0slKeb2siVleJfUg1j7beWUTmM_S
     networks:
@@ -75,7 +75,7 @@ services:
         - "traefik.enable=true"
         - "traefik.swarm.network=web-net"
         # We will expose this on a separate subdomain for the AI
-        - "traefik.http.routers.komodomcp.rule=Host(`mcp.${DOMAIN:-liaxum.fr}`)"
+        - "traefik.http.routers.komodomcp.rule=Host(`${MCP_SUBDOMAIN:-mcp}.${DOMAIN:-liaxum.fr}`)"
         - "traefik.http.routers.komodomcp.entrypoints=websecure"
         - "traefik.http.routers.komodomcp.tls=true"
         - "traefik.http.services.komodomcp.loadbalancer.server.port=8000"
