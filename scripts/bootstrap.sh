@@ -293,6 +293,14 @@ EOF
   printf '    stacks: %s %s %s %s\n' "$TRAEFIK_STACK" "$VPN_STACK" "$FILES_STACK" "$MONITOR_STACK"
 }
 
+# A precondition this run cannot meet. Fatal normally; under --dry-run it is
+# information, because seeing the whole plan is more useful than stopping at
+# the first thing that is not ready yet.
+blocker() {
+  (( DRY_RUN )) && { warn "$*"; return 0; }
+  die "$*"
+}
+
 # Ask a yes/no question. Returns false when there is no terminal, so
 # non-interactive runs fall through to the explicit failure instead of
 # hanging or silently changing a host.
@@ -305,14 +313,18 @@ confirm() {
 
 # May this run change the target host? True with --with-host-setup, or when
 # the operator says yes to the specific change being proposed.
-may_fix() { (( WITH_HOST_SETUP )) || confirm "$1"; }
+may_fix() {
+  # Never prompt during a dry run: report the offer and carry on planning.
+  (( DRY_RUN )) && { printf '    would ask: %s\n' "$1"; return 0; }
+  (( WITH_HOST_SETUP )) || confirm "$1"
+}
 
 ensure_nfs_client() {
   local where="${SSH_TARGET:-this machine}"
   host_eval 'command -v mount.nfs4 >/dev/null 2>&1' && { skip "NFS client utilities present"; return; }
 
   may_fix "NFS client utilities are missing on $where. Install them?" \
-    || die "NFS client utilities missing on $where. Install nfs-common (Debian/Ubuntu) or nfs-utils (Arch), or re-run with --with-host-setup."
+    || { blocker "NFS client utilities missing on $where. Install nfs-common (Debian/Ubuntu) or nfs-utils (Arch), or re-run with --with-host-setup."; return; }
 
   if host_eval 'command -v apt-get >/dev/null 2>&1'; then
     host_run 'sudo apt-get update && sudo apt-get install -y nfs-common'
@@ -327,7 +339,7 @@ ensure_swarm() {
   swarm_active && { skip "swarm already initialised"; return; }
 
   may_fix "The target is not in a swarm. Initialise one?" \
-    || die "the target is not in a swarm. Run 'docker swarm init' on it, or re-run with --with-host-setup."
+    || { blocker "the target is not in a swarm. Run 'docker swarm init' on it, or re-run with --with-host-setup."; return; }
 
   if [[ -n "$SWARM_ADVERTISE_ADDR" ]]; then
     host_run "docker swarm init --advertise-addr $SWARM_ADVERTISE_ADDR"
@@ -341,7 +353,7 @@ ensure_vpn_dir() {
   host_eval 'test -d /opt/vpn/data' && { skip "/opt/vpn/data exists"; return; }
 
   may_fix "/opt/vpn/data does not exist on $where (headscale's state). Create it?" \
-    || die "/opt/vpn/data does not exist on $where. Create it, or re-run with --with-host-setup."
+    || { blocker "/opt/vpn/data does not exist on $where. Create it, or re-run with --with-host-setup."; return; }
 
   host_run 'sudo mkdir -p /opt/vpn/data'
 }
@@ -386,7 +398,8 @@ stage_swarm() {
     endpoint="${DOCKER_HOST:-$(docker context show 2>/dev/null || echo default)}"
     # || true: pipefail would otherwise abort the function before die runs
     state="$(docker info --format '{{.Swarm.LocalNodeState}}' 2>&1 | tail -1)" || true
-    die "the daemon at $endpoint reports swarm state '${state:-unreachable}'. Run the host stage, which offers to initialise a swarm, or check that --ssh/DOCKER_HOST points where you think."
+    blocker "the daemon at $endpoint reports swarm state '${state:-unreachable}'. Run the host stage, which offers to initialise a swarm, or check that --ssh/DOCKER_HOST points where you think."
+    return
   fi
 
   if net_exists web-net; then
@@ -405,7 +418,7 @@ stage_swarm() {
     elif [[ -f "$file" ]]; then
       run docker secret create "$name" "$file"
     else
-      die "secret $name is missing and $file does not exist. Put the certificate there, or set CRT_FILE/KEY_FILE."
+      blocker "secret $name is missing and $file does not exist. Put the certificate there, or set CRT_FILE/KEY_FILE."
     fi
   done
 
@@ -471,7 +484,7 @@ Join the mesh, then re-run with: $0 --from nfs
   sudo tailscale up --login-server https://$VPN_SUBDOMAIN.$DOMAIN --authkey <key>
 
 EOF
-  die "not joined to the mesh"
+  blocker "not joined to the mesh"
 }
 
 stage_nfs() {
