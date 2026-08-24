@@ -60,10 +60,16 @@ safe to re-run — every stage checks before it acts.
 ./scripts/bootstrap.sh --ssh user@host    # repo here, cluster there
 ```
 
-Without `--with-host-setup` it touches nothing outside Docker: it checks the
-prerequisites and stops with the exact command to run if one is missing. With
-it, it installs the NFS client utilities, initialises the swarm, creates
-`/opt/vpn/data` and adds the ufw rule.
+Each host prerequisite offers to fix itself when it is missing:
+
+```
+    NFS client utilities are missing on root@liaxum.fr. Install them? [y/N]:
+```
+
+`--with-host-setup` answers yes to all of them up front. Decline, or run with
+no terminal to answer, and the script stops with the command that fixes it —
+so a scripted run never changes a host without being told to, and never hangs
+waiting for an answer nobody can give.
 
 ### Startup mode
 

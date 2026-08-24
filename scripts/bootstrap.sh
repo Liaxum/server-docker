@@ -293,66 +293,86 @@ EOF
   printf '    stacks: %s %s %s %s\n' "$TRAEFIK_STACK" "$VPN_STACK" "$FILES_STACK" "$MONITOR_STACK"
 }
 
-stage_host() {
+# Ask a yes/no question. Returns false when there is no terminal, so
+# non-interactive runs fall through to the explicit failure instead of
+# hanging or silently changing a host.
+confirm() {
+  local reply
+  [[ -t 0 ]] || return 1
+  read -rp "    $1 [y/N]: " reply
+  [[ "$reply" =~ ^[Yy] ]]
+}
+
+# May this run change the target host? True with --with-host-setup, or when
+# the operator says yes to the specific change being proposed.
+may_fix() { (( WITH_HOST_SETUP )) || confirm "$1"; }
+
+ensure_nfs_client() {
   local where="${SSH_TARGET:-this machine}"
+  host_eval 'command -v mount.nfs4 >/dev/null 2>&1' && { skip "NFS client utilities present"; return; }
 
-  if (( ! WITH_HOST_SETUP )); then
-    skip "host setup not requested; checking prerequisites on $where"
+  may_fix "NFS client utilities are missing on $where. Install them?" \
+    || die "NFS client utilities missing on $where. Install nfs-common (Debian/Ubuntu) or nfs-utils (Arch), or re-run with --with-host-setup."
 
-    host_eval 'command -v mount.nfs4 >/dev/null 2>&1' \
-      || die "NFS client utilities missing on $where. Install nfs-common (Debian/Ubuntu) or nfs-utils (Arch), or re-run with --with-host-setup."
-    swarm_active \
-      || die "the target is not in a swarm. Run 'docker swarm init' on it, or re-run with --with-host-setup."
-    host_eval 'test -d /opt/vpn/data' \
-      || die "/opt/vpn/data does not exist on $where (headscale's state directory). Create it, or re-run with --with-host-setup."
-
-    if host_eval 'command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active"'; then
-      host_eval 'ufw status | grep -q "2049.*tailscale0"' \
-        || warn "no ufw rule allowing 2049 on tailscale0. Local mounts work without it, but worker nodes will not be able to mount the export."
-    fi
-    ok "host prerequisites present on $where"
-    return
-  fi
-
-  info "preparing $where (requires sudo)"
-
-  if docker_is_remote; then
-    die "docker is pointed at a remote daemon ($(docker info --format '{{.Name}}')), but --with-host-setup changes THIS machine. Use --ssh to target that host, or run it there directly."
-  fi
-
-  if host_eval 'command -v mount.nfs4 >/dev/null 2>&1'; then
-    skip "NFS client utilities already installed"
-  elif host_eval 'command -v apt-get >/dev/null 2>&1'; then
+  if host_eval 'command -v apt-get >/dev/null 2>&1'; then
     host_run 'sudo apt-get update && sudo apt-get install -y nfs-common'
   elif host_eval 'command -v pacman >/dev/null 2>&1'; then
     host_run 'sudo pacman -S --needed --noconfirm nfs-utils'
   else
     die "cannot install NFS client utilities on $where: neither apt-get nor pacman found"
   fi
+}
 
-  if swarm_active; then
-    skip "swarm already initialised"
-  elif [[ -n "$SWARM_ADVERTISE_ADDR" ]]; then
+ensure_swarm() {
+  swarm_active && { skip "swarm already initialised"; return; }
+
+  may_fix "The target is not in a swarm. Initialise one?" \
+    || die "the target is not in a swarm. Run 'docker swarm init' on it, or re-run with --with-host-setup."
+
+  if [[ -n "$SWARM_ADVERTISE_ADDR" ]]; then
     host_run "docker swarm init --advertise-addr $SWARM_ADVERTISE_ADDR"
   else
     host_run 'docker swarm init'
   fi
+}
 
-  if host_eval 'test -d /opt/vpn/data'; then
-    skip "/opt/vpn/data exists"
+ensure_vpn_dir() {
+  local where="${SSH_TARGET:-this machine}"
+  host_eval 'test -d /opt/vpn/data' && { skip "/opt/vpn/data exists"; return; }
+
+  may_fix "/opt/vpn/data does not exist on $where (headscale's state). Create it?" \
+    || die "/opt/vpn/data does not exist on $where. Create it, or re-run with --with-host-setup."
+
+  host_run 'sudo mkdir -p /opt/vpn/data'
+}
+
+ensure_ufw_rule() {
+  host_eval 'command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active"' \
+    || { skip "ufw inactive or absent; nothing to open"; return; }
+  host_eval 'ufw status | grep -q "2049.*tailscale0"' && { skip "ufw allows 2049 on tailscale0"; return; }
+
+  # Not fatal: local mounts work without it, only worker nodes need it.
+  if may_fix "ufw does not allow 2049 on tailscale0, so worker nodes cannot mount the export. Add the rule?"; then
+    host_run 'sudo ufw allow in on tailscale0 to any port 2049 proto tcp && sudo ufw reload'
   else
-    host_run 'sudo mkdir -p /opt/vpn/data'
+    warn "no ufw rule allowing 2049 on tailscale0. Local mounts work without it, but worker nodes will not be able to mount the export."
+  fi
+}
+
+stage_host() {
+  local where="${SSH_TARGET:-this machine}"
+  info "host prerequisites on $where"
+
+  # Without --ssh a remote daemon means the checks would inspect this machine
+  # while the cluster lives elsewhere, and any fix would land here too.
+  if docker_is_remote; then
+    die "docker is pointed at a remote daemon ($(docker info --format '{{.Name}}')), so host checks would run against the wrong machine. Use --ssh <user@host> to target it, or run this on the manager itself."
   fi
 
-  if host_eval 'command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active"'; then
-    if host_eval 'ufw status | grep -q "2049.*tailscale0"'; then
-      skip "ufw already allows 2049 on tailscale0"
-    else
-      host_run 'sudo ufw allow in on tailscale0 to any port 2049 proto tcp && sudo ufw reload'
-    fi
-  else
-    skip "ufw inactive or absent; nothing to open"
-  fi
+  ensure_nfs_client
+  ensure_swarm
+  ensure_vpn_dir
+  ensure_ufw_rule
 
   ok "$where ready"
 }
