@@ -123,6 +123,17 @@ ask() {
   export "$var=$reply"
 }
 
+# True when the docker CLI is pointed at a daemon on another machine, e.g.
+# via `docker context use`. Deploys work fine that way -- compose files are
+# read client-side and the spec is sent over -- but anything that inspects or
+# modifies the host would act on the wrong machine.
+docker_is_remote() {
+  local daemon
+  daemon="$(docker info --format '{{.Name}}' 2>/dev/null)" || return 1
+  [[ -n "$daemon" ]] || return 1
+  [[ "${daemon%%.*}" != "$(hostname -s 2>/dev/null || hostname)" ]]
+}
+
 # Is an IPv4 address inside a CIDR? Returns 2 when the inputs are not plain
 # IPv4, so callers can skip the check rather than reject an IPv6 setup.
 cidr_contains() {
@@ -262,6 +273,10 @@ stage_host() {
 
   info "preparing the host (requires sudo)"
 
+  if docker_is_remote; then
+    die "docker is pointed at a remote daemon ($(docker info --format '{{.Name}}')), but --with-host-setup installs packages, edits ufw and creates directories on THIS machine. Run it on the manager node itself."
+  fi
+
   if have mount.nfs4; then
     skip "NFS client utilities already installed"
   elif have apt-get; then
@@ -351,6 +366,11 @@ stage_mesh() {
 
   if (( DRY_RUN )); then
     skip "would check that $MESH_ADDR is assigned to this host"
+    return
+  fi
+
+  if docker_is_remote; then
+    skip "docker is remote; cannot check this host for $MESH_ADDR -- verify on the manager node"
     return
   fi
 

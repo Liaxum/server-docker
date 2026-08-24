@@ -64,6 +64,26 @@ prerequisites and stops with the exact command to run if one is missing. With
 it, it installs the NFS client utilities, initialises the swarm, creates
 `/opt/vpn/data` and adds the ufw rule.
 
+### Driving it from another machine
+
+`docker stack deploy -c file` reads the compose file **client-side** and sends
+the resulting spec to the daemon, as do `docker compose -f`, `docker secret
+create` and `docker config create`. So with a remote context —
+
+```bash
+docker context create vps --docker host=ssh://liaxum-vps
+docker context use vps
+```
+
+— the repo has to be on the machine running the CLI, not on the server. Every
+docker-facing stage then works: bind mounts like `/opt/vpn/data` and the
+`nfs_data` volume resolve on the daemon's host.
+
+Two stages do not, because they inspect or modify the host rather than Docker:
+`--with-host-setup` installs packages and edits ufw, and `mesh` checks which
+addresses this machine holds. Both refuse to run against a remote daemon
+rather than acting on the wrong machine — run them on the manager itself.
+
 ### Settings
 
 The first run asks for the values that differ per install and stores them in
