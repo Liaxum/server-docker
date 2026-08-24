@@ -553,10 +553,14 @@ stage_vpn() {
   deploy apps/vpn/compose.yml "$VPN_STACK"
 }
 
+mesh_addr_held() {
+  host_eval "ip -4 -oneline addr show 2>/dev/null | grep -qw $MESH_ADDR"
+}
+
 # Install tailscale, mint a headscale pre-auth key, and join. Each step asks
 # first, so a plain run still lets the operator do it by hand.
 join_mesh() {
-  local where="${SSH_TARGET:-this host}" container key
+  local where="${SSH_TARGET:-this host}" container key out
 
   if ! host_eval 'command -v tailscale >/dev/null 2>&1'; then
     may_fix "tailscale is not installed on $where. Install it (runs Tailscale's installer: curl -fsSL https://tailscale.com/install.sh | sh)?" \
@@ -572,19 +576,58 @@ join_mesh() {
   # Already-exists is the normal case on a re-run, so its failure is not fatal.
   host_eval "docker exec $container headscale users create $MESH_USER" >/dev/null 2>&1 || true
 
-  # --output json where available; older builds print the key on its own line.
-  key="$(host_eval "docker exec $container headscale preauthkeys create --user $MESH_USER --reusable --expiration 1h --output json 2>/dev/null" \
-        | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)" || key=""
+  # Keep stderr: when this fails it is the only thing that explains why, and
+  # headscale's CLI has changed shape across releases.
+  out="$(host_eval "docker exec $container headscale preauthkeys create --user $MESH_USER --reusable --expiration 1h --output json 2>&1")" || true
+  key="$(printf '%s' "$out" | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)"
   if [[ -z "$key" ]]; then
-    key="$(host_eval "docker exec $container headscale preauthkeys create --user $MESH_USER --reusable --expiration 1h 2>/dev/null" \
-          | tail -1 | tr -d '[:space:]')" || key=""
+    out="$(host_eval "docker exec $container headscale preauthkeys create --user $MESH_USER --reusable --expiration 1h 2>&1")" || true
+    key="$(printf '%s' "$out" | tail -1 | tr -d '[:space:]')"
+    # A usable key is a long opaque token; anything else is an error message.
+    [[ "$key" =~ ^[A-Za-z0-9]{20,}$ ]] || key=""
   fi
-  [[ -n "$key" ]] || { warn "could not mint a pre-auth key from $container"; return 1; }
 
-  # The key is short-lived, but keep it off the terminal all the same.
+  if [[ -z "$key" ]]; then
+    warn "could not mint a pre-auth key from $container. headscale said:"
+    printf '%s\n' "$out" | tail -5 | sed 's/^/      /' >&2
+    return 1
+  fi
+
   host_run "sudo tailscale up --login-server https://$VPN_SUBDOMAIN.$DOMAIN --authkey $key >/dev/null" \
     || { warn "tailscale up failed; is https://$VPN_SUBDOMAIN.$DOMAIN resolving and serving a valid certificate?"; return 1; }
   return 0
+}
+
+# Show what to run, then wait rather than exiting: the operator finishes the
+# join in another terminal and the run carries on from where it paused.
+wait_for_mesh() {
+  cat >&2 <<EOF
+
+${SSH_TARGET:-This host} does not hold $MESH_ADDR yet, so the NFS server cannot bind it.
+Run this on ${SSH_TARGET:-this host}, then come back:
+
+  C=\$(docker ps -qf name=${VPN_STACK}_core)
+  docker exec \$C headscale users list
+  docker exec \$C headscale preauthkeys create --user $MESH_USER --reusable --expiration 1h
+  sudo tailscale up --login-server https://$VPN_SUBDOMAIN.$DOMAIN --authkey <key>
+
+EOF
+  [[ -t 0 ]] || return 1
+
+  while true; do
+    printf '    Press Enter once joined, or Ctrl-C to stop: ' >&2
+    read -r _ || return 1
+    mesh_addr_held && return 0
+    warn "${SSH_TARGET:-this host} still does not hold $MESH_ADDR"
+  done
+}
+
+# headscale allocates in order, so the address is not ours to choose.
+check_mesh_addr() {
+  local got
+  got="$(host_eval 'tailscale ip -4 2>/dev/null | head -1' | tr -d '[:space:]')" || got=""
+  [[ -z "$got" || "$got" == "$MESH_ADDR" ]] && return 0
+  die "joined the mesh, but headscale assigned $got rather than $MESH_ADDR. Set MESH_ADDR to $got (re-run with --reconfigure): the NFS server binds it, and the clients mount it."
 }
 
 stage_mesh() {
@@ -600,35 +643,21 @@ stage_mesh() {
     return
   fi
 
-  if host_eval "ip -4 -oneline addr show 2>/dev/null | grep -qw $MESH_ADDR"; then
+  if mesh_addr_held; then
     ok "$MESH_ADDR is assigned to ${SSH_TARGET:-this host}"
     return
   fi
 
-  if join_mesh; then
-    local got
-    got="$(host_eval 'tailscale ip -4 2>/dev/null | head -1' | tr -d '[:space:]')" || got=""
-    if [[ "$got" == "$MESH_ADDR" ]]; then
-      ok "joined the mesh as $MESH_ADDR"
-      return
-    fi
-    # headscale allocates in order, so the address is not ours to choose.
-    die "joined the mesh, but headscale assigned ${got:-no address} rather than $MESH_ADDR. Set MESH_ADDR to $got (re-run with --reconfigure): the NFS server binds it, and the clients mount it."
+  if join_mesh && mesh_addr_held; then
+    ok "joined the mesh as $MESH_ADDR"
+    return
   fi
+  check_mesh_addr
 
-  cat >&2 <<EOF
-
-${SSH_TARGET:-This host} does not hold $MESH_ADDR yet, so the NFS server cannot bind it.
-Join the mesh, then re-run with: $0 --from nfs
-
-On ${SSH_TARGET:-this host}:
-
-  C=\$(docker ps -qf name=${VPN_STACK}_core)
-  docker exec \$C headscale users create $MESH_USER
-  docker exec \$C headscale preauthkeys create --user $MESH_USER --reusable --expiration 1h
-  sudo tailscale up --login-server https://$VPN_SUBDOMAIN.$DOMAIN --authkey <key>
-
-EOF
+  if wait_for_mesh; then
+    ok "$MESH_ADDR is assigned to ${SSH_TARGET:-this host}"
+    return
+  fi
   blocker "not joined to the mesh"
 }
 

@@ -188,8 +188,9 @@ mismatched pair otherwise deploys cleanly and fails TLS at runtime.
 
 The `mesh` stage joins the node for you: it offers to install Tailscale, mints
 a headscale pre-auth key through the running `<vpn stack>_core` container, and
-runs `tailscale up`. Each step asks first, so declining still prints the
-commands to run by hand. headscale allocates addresses in order rather than
+runs `tailscale up`. Each step asks first, and if any of it fails
+the stage prints the commands and **waits** rather than exiting — finish the
+join in another terminal, press Enter, and the run continues from there. headscale allocates addresses in order rather than
 letting you pick, so if it hands out something other than `MESH_ADDR` the stage
 stops and tells you what to set — the NFS server binds that address and every
 client mounts it.
