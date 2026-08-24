@@ -607,9 +607,17 @@ stage_monitor()     { info "komodo";      deploy apps/monitor/compose.yml "$MONI
 # That is enough to tell a live key from one left over after the database was
 # replaced -- which otherwise sits in bootstrap.env looking perfectly valid.
 headplane_key_live() {
-  local container="$1" key="$2" prefix
-  prefix="${key%%.*}"
-  [[ -n "$prefix" && "$prefix" != "$key" ]] || return 1
+  local container="$1" key="$2" prefix rest
+  # Older keys are prefix.secret; newer ones are hskey-api-<prefix>-<secret>.
+  if [[ "$key" == *.* ]]; then
+    prefix="${key%%.*}"
+  elif [[ "$key" == hskey-api-* ]]; then
+    rest="${key#hskey-api-}"
+    prefix="${rest%%-*}"
+  fi
+  # An unrecognised shape is not evidence of staleness: leave the key alone
+  # rather than replacing a working one on every run.
+  [[ -n "$prefix" ]] || return 0
   host_eval "docker exec $container headscale apikeys list 2>/dev/null" | grep -qF "$prefix"
 }
 
@@ -757,23 +765,30 @@ join_mesh() {
 
   # Keep stderr: when this fails it is the only thing that explains why, and
   # headscale's CLI has changed shape across releases.
+  local attempts=""
   for ref in "${refs[@]}"; do
     out="$(host_eval "docker exec $container headscale preauthkeys create --user $ref --reusable --expiration 1h --output json 2>&1")" || true
     key="$(printf '%s' "$out" | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)" || true
     if [[ -z "$key" ]]; then
       out="$(host_eval "docker exec $container headscale preauthkeys create --user $ref --reusable --expiration 1h 2>&1")" || true
       key="$(printf '%s' "$out" | tail -1 | tr -d '[:space:]')" || true
-      # A usable key is a long opaque token; anything else is an error message.
-      [[ "$key" =~ ^[A-Za-z0-9]{20,}$ ]] || key=""
+      # A key is one long unbroken token. Hyphens and underscores are part of
+      # it -- hskey-auth-... -- so only whitespace and length separate a key
+      # from an error message.
+      [[ "$key" =~ ^[A-Za-z0-9._-]{20,}$ ]] || key=""
     fi
     [[ -n "$key" ]] && break
+    # Keep each failure: reporting only the last hides which attempt is the
+    # one worth reading.
+    attempts="${attempts}--user ${ref}: $(printf '%s' "$out" | tail -1)
+"
   done
 
   # A key is the tidy path, not the only one: without one the node asks
   # headscale to register it, and that request can be approved below.
   if [[ -z "$key" ]]; then
     warn "could not mint a pre-auth key from $container. headscale said:"
-    printf '%s\n' "$out" | tail -3 | sed 's/^/      /' >&2
+    printf '%s' "$attempts" | sed 's/^/      /' >&2
     warn "joining without one; headscale will be asked to register this node instead"
   fi
 
