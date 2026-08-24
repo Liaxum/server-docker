@@ -569,13 +569,21 @@ stage_mesh() {
 
   # Joining is interactive, or needs a pre-auth key minted inside headscale.
   # Automating it would mean generating keys on every run, so stop instead.
+  # container_name is ignored by swarm, so the container is <stack>_core.N.<id>
+  # and "docker exec headscale" would not find it.
+  host_eval 'command -v tailscale >/dev/null 2>&1' \
+    || warn "tailscale is not installed on ${SSH_TARGET:-this host}, so the last step below will not run yet. Tailscale's own installer is: curl -fsSL https://tailscale.com/install.sh | sh"
+
   cat >&2 <<EOF
 
 ${SSH_TARGET:-This host} does not hold $MESH_ADDR yet, so the NFS server cannot bind it.
 Join the mesh, then re-run with: $0 --from nfs
 
-  docker exec headscale headscale users create \$USER
-  docker exec headscale headscale preauthkeys create --user \$USER --reusable --expiration 1h
+On ${SSH_TARGET:-this host}, replacing <user> with a name for yourself:
+
+  C=\$(docker ps -qf name=${VPN_STACK}_core)
+  docker exec \$C headscale users create <user>
+  docker exec \$C headscale preauthkeys create --user <user> --reusable --expiration 1h
   sudo tailscale up --login-server https://$VPN_SUBDOMAIN.$DOMAIN --authkey <key>
 
 EOF
