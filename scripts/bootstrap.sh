@@ -10,6 +10,8 @@
 #   ./scripts/bootstrap.sh --with-host-setup    # also prepare the host (sudo)
 #   ./scripts/bootstrap.sh --reconfigure        # re-ask the settings
 #   ./scripts/bootstrap.sh --ssh user@host      # repo here, cluster there
+#   ./scripts/bootstrap.sh --reset-config       # forget the answers, start over
+#   ./scripts/bootstrap.sh --uninstall          # remove what this script created
 #   ./scripts/bootstrap.sh --from nfs           # resume from a stage
 #   ./scripts/bootstrap.sh --only monitor       # run a single stage
 #   ./scripts/bootstrap.sh --dry-run            # print what would run
@@ -38,6 +40,9 @@ ENV_FILE="${ENV_FILE:-bootstrap.env}"
 WITH_HOST_SETUP=0
 RECONFIGURE=0
 SSH_TARGET=""
+RESET_CONFIG=0
+UNINSTALL=0
+WITH_DATA=0
 DRY_RUN=0
 FROM_STAGE=""
 ONLY_STAGE=""
@@ -82,6 +87,9 @@ while (( $# )); do
   case "$1" in
     --with-host-setup) WITH_HOST_SETUP=1 ;;
     --reconfigure)     RECONFIGURE=1 ;;
+    --reset-config)    RESET_CONFIG=1 ;;
+    --uninstall)       UNINSTALL=1 ;;
+    --with-data)       WITH_DATA=1 ;;
     --ssh)             SSH_TARGET="${2:?--ssh needs user@host}"; shift ;;
     --dry-run)         DRY_RUN=1 ;;
     --from)            FROM_STAGE="${2:?--from needs a stage}"; shift ;;
@@ -799,7 +807,106 @@ EOF
 
 # ------------------------------------------------------------------ main ---
 
+# --- modes that replace the stage run --------------------------------------
+
+# Forget the answers. Deliberately does not touch the cluster: the next run
+# asks again and redeploys over whatever is there.
+do_reset_config() {
+  info "resetting configuration"
+  local f removed=0
+  for f in "$ENV_FILE" apps/vpn/config.yaml apps/vpn/headplane_config.yaml; do
+    if [[ -f "$f" ]]; then
+      run rm -f "$f"
+      ok "removed $f"
+      removed=1
+    else
+      skip "$f is not there"
+    fi
+  done
+  (( removed )) && printf '    Run the script again to answer afresh.\n'
+  return 0
+}
+
+# Remove what this script created. Host changes -- packages, the hostname,
+# tailscale, the swarm itself -- are left alone: they are not ours to undo.
+do_uninstall() {
+  info "uninstalling from ${SSH_TARGET:-this machine}"
+
+  local stacks=("$MONITOR_STACK" "$FILES_STACK" "$VPN_STACK" "$TRAEFIK_STACK")
+  local present=() volumes=() st
+  for st in "${stacks[@]}"; do
+    docker stack ls --format '{{.Name}}' 2>/dev/null | grep -qx "$st" && present+=("$st")
+  done
+
+  volumes=("${MONITOR_STACK}_mongo-data" "${MONITOR_STACK}_mongo-config" \
+           "${MONITOR_STACK}_keys" "${FILES_STACK}_config" nfs_data)
+
+  printf '    stacks:  %s\n' "${present[*]:-none}"
+  printf '    network: web-net\n'
+  printf '    secrets: liaxum_crt liaxum_key\n'
+  printf '    configs: traefik_dynamic, and the vpn config objects\n'
+  if (( WITH_DATA )); then
+    printf '    %svolumes: %s%s\n' "$RED" "${volumes[*]}" "$OFF"
+    printf '    %sthis destroys the komodo database, the keys and the shared files%s\n' "$RED" "$OFF"
+  else
+    printf '    volumes: kept (pass --with-data to remove them too)\n'
+  fi
+
+  if (( ! DRY_RUN )); then
+    if [[ -t 0 ]]; then
+      local reply
+      read -rp "    Type the manager hostname ($MANAGER_HOSTNAME) to confirm: " reply
+      [[ "$reply" == "$MANAGER_HOSTNAME" ]] || die "not confirmed; nothing was removed"
+    else
+      die "uninstall needs a terminal to confirm on"
+    fi
+  fi
+
+  for st in "${present[@]}"; do run docker stack rm "$st"; done
+
+  # Networks and volumes stay busy until the tasks actually stop.
+  if (( ! DRY_RUN )) && (( ${#present[@]} )); then
+    printf '    waiting for tasks to stop' >&2
+    local i
+    for i in $(seq 1 30); do
+      docker service ls --format '{{.Name}}' 2>/dev/null | grep -qE "^($(IFS='|'; echo "${present[*]}"))_" || break
+      printf '.' >&2; sleep 2
+    done
+    printf '\n' >&2
+  fi
+
+  [[ -f apps/nfs/compose.yml ]] && run docker compose -f apps/nfs/compose.yml down
+
+  local obj
+  for obj in liaxum_crt liaxum_key; do
+    secret_exists "$obj" && run docker secret rm "$obj"
+  done
+  for obj in $(docker config ls --format '{{.Name}}' 2>/dev/null | grep -E '^(traefik_dynamic|headscale_config_|headplane_config_)' || true); do
+    run docker config rm "$obj"
+  done
+  net_exists web-net && run docker network rm web-net
+
+  if (( WITH_DATA )); then
+    local v
+    for v in "${volumes[@]}"; do
+      docker volume inspect "$v" >/dev/null 2>&1 && run docker volume rm "$v"
+    done
+    warn "volumes on other nodes are not reachable from here; remove ${MONITOR_STACK}_keys on each worker"
+  fi
+
+  ok "uninstalled"
+  return 0
+}
+
 load_env
+
+if (( RESET_CONFIG )); then do_reset_config; exit 0; fi
+if (( UNINSTALL )); then
+  [[ -n "${MANAGER_HOSTNAME:-}" ]] || die "no settings found, so there is nothing to identify. Uninstall needs $ENV_FILE."
+  require_settings
+  do_uninstall
+  exit 0
+fi
 
 started=0
 for stage in "${STAGES[@]}"; do

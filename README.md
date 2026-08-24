@@ -139,6 +139,29 @@ The connection is checked once up front, so an unreachable host fails as a
 connection error instead of surfacing as a missing package or an absent
 directory in every later check. `sudo` gets a terminal, so it can prompt.
 
+### Starting over, and removing it
+
+```bash
+./scripts/bootstrap.sh --reset-config              # forget the answers
+./scripts/bootstrap.sh --uninstall                 # remove the stacks and objects
+./scripts/bootstrap.sh --uninstall --with-data     # and the volumes
+```
+
+`--reset-config` deletes `bootstrap.env` and the rendered vpn configs and
+touches nothing else, so the next run asks afresh and redeploys over whatever
+is running.
+
+`--uninstall` removes the four stacks, the standalone NFS compose project,
+`web-net`, the TLS secrets and the config objects. It prints what it found
+before doing anything and asks you to type the manager hostname; without a
+terminal to ask on, it refuses. Volumes are kept unless `--with-data` is
+given, which destroys the Komodo database, the keys and the shared files.
+
+What it will not undo: packages it installed, the hostname it set, Tailscale,
+and the swarm itself. Those are the host's, not this script's, and guessing at
+which of them predated the bootstrap is how you break a machine. Volumes on
+worker nodes are also out of reach — remove `<monitor stack>_keys` on each.
+
 ### Settings
 
 The first run asks for the values that differ per install and stores them in
