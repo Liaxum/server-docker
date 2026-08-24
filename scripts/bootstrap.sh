@@ -234,6 +234,31 @@ require_settings() {
   export HEADPLANE_COOKIE_SECRET="${HEADPLANE_COOKIE_SECRET:-}"
 }
 
+write_env() {
+  umask 077
+  cat > "$ENV_FILE" <<EOF
+# Written by scripts/bootstrap.sh. Gitignored: contains credentials.
+DOMAIN=$DOMAIN
+MANAGER_HOSTNAME=$MANAGER_HOSTNAME
+MESH_ADDR=$MESH_ADDR
+MESH_CIDR=$MESH_CIDR
+TRAEFIK_STACK=$TRAEFIK_STACK
+VPN_STACK=$VPN_STACK
+VPN_SUBDOMAIN=$VPN_SUBDOMAIN
+FILES_STACK=$FILES_STACK
+FILES_SUBDOMAIN=$FILES_SUBDOMAIN
+MONITOR_STACK=$MONITOR_STACK
+MONITOR_SUBDOMAIN=$MONITOR_SUBDOMAIN
+MCP_SUBDOMAIN=$MCP_SUBDOMAIN
+MESH_USER=$MESH_USER
+CRT_FILE=$CRT_FILE
+KEY_FILE=$KEY_FILE
+HEADPLANE_API_KEY=$HEADPLANE_API_KEY
+HEADPLANE_COOKIE_SECRET=$HEADPLANE_COOKIE_SECRET
+EOF
+  ok "saved $ENV_FILE"
+}
+
 stage_config() {
   info "settings"
   [[ -f "$ENV_FILE" ]] && skip "loaded $ENV_FILE"
@@ -277,28 +302,7 @@ stage_config() {
   if (( DRY_RUN )); then
     skip "would write $ENV_FILE"
   else
-    umask 077
-    cat > "$ENV_FILE" <<EOF
-# Written by scripts/bootstrap.sh. Gitignored: contains credentials.
-DOMAIN=$DOMAIN
-MANAGER_HOSTNAME=$MANAGER_HOSTNAME
-MESH_ADDR=$MESH_ADDR
-MESH_CIDR=$MESH_CIDR
-TRAEFIK_STACK=$TRAEFIK_STACK
-VPN_STACK=$VPN_STACK
-VPN_SUBDOMAIN=$VPN_SUBDOMAIN
-FILES_STACK=$FILES_STACK
-FILES_SUBDOMAIN=$FILES_SUBDOMAIN
-MONITOR_STACK=$MONITOR_STACK
-MONITOR_SUBDOMAIN=$MONITOR_SUBDOMAIN
-MCP_SUBDOMAIN=$MCP_SUBDOMAIN
-MESH_USER=$MESH_USER
-CRT_FILE=$CRT_FILE
-KEY_FILE=$KEY_FILE
-HEADPLANE_API_KEY=$HEADPLANE_API_KEY
-HEADPLANE_COOKIE_SECRET=$HEADPLANE_COOKIE_SECRET
-EOF
-    ok "saved $ENV_FILE"
+    write_env
   fi
 
   printf '    %s, manager %s, mesh %s in %s\n' "*.$DOMAIN" "$MANAGER_HOSTNAME" "$MESH_ADDR" "$MESH_CIDR"
@@ -545,12 +549,45 @@ stage_traefik()     { info "traefik";     deploy traefik/compose.yml "$TRAEFIK_S
 stage_filebrowser() { info "filebrowser"; deploy apps/filebrowser/compose.yml "$FILES_STACK"; }
 stage_monitor()     { info "komodo";      deploy apps/monitor/compose.yml "$MONITOR_STACK"; }
 
+# Headplane authenticates to headscale with an API key. Leaving it blank
+# renders a config whose UI cannot read anything, so mint one and keep it.
+ensure_headplane_key() {
+  local container out key
+  [[ -n "${HEADPLANE_API_KEY:-}" ]] && return 1
+  (( DRY_RUN )) && { skip "would mint a headplane API key"; return 1; }
+
+  container="$(host_eval "docker ps -qf name=${VPN_STACK}_core | head -1")" || container=""
+  [[ -n "$container" ]] || return 1
+
+  may_fix "Headplane has no API key, so its admin UI cannot read headscale. Mint one?" || return 1
+
+  out="$(host_eval "docker exec $container headscale apikeys create --expiration 90d 2>&1")" || true
+  key="$(printf '%s' "$out" | tr -d '\r' | grep -Eo '[A-Za-z0-9_.-]{30,}' | tail -1)"
+  if [[ -z "$key" ]]; then
+    warn "could not mint a headplane API key. headscale said:"
+    printf '%s\n' "$out" | tail -5 | sed 's/^/      /' >&2
+    return 1
+  fi
+
+  HEADPLANE_API_KEY="$key"
+  write_env
+  ok "minted a headplane API key (90d) and saved it to $ENV_FILE"
+  return 0
+}
+
 stage_vpn() {
   info "headscale"
   # compose reads these as files, so they are rendered rather than interpolated
   [[ -f apps/vpn/config.yaml.template ]] && render apps/vpn/config.yaml.template
   [[ -f apps/vpn/headplane_config.yaml.template ]] && render apps/vpn/headplane_config.yaml.template
   deploy apps/vpn/compose.yml "$VPN_STACK"
+
+  # The key can only be minted once headscale is running, so re-render and
+  # redeploy when we get one.
+  if ensure_headplane_key; then
+    render apps/vpn/headplane_config.yaml.template
+    deploy apps/vpn/compose.yml "$VPN_STACK"
+  fi
 }
 
 # headscale >= 0.24 wants a numeric id for --user and rejects the name:
@@ -610,8 +647,10 @@ join_mesh() {
     return 1
   fi
 
-  host_run "sudo tailscale up --login-server https://$VPN_SUBDOMAIN.$DOMAIN --authkey $key >/dev/null" \
-    || { warn "tailscale up failed; is https://$VPN_SUBDOMAIN.$DOMAIN resolving and serving a valid certificate?"; return 1; }
+  # Without a timeout this retries an unreachable control server forever,
+  # which looks like the command doing nothing at all.
+  host_run "sudo tailscale up --timeout 45s --login-server https://$VPN_SUBDOMAIN.$DOMAIN --authkey $key >/dev/null" \
+    || { warn "tailscale up did not complete. Check that https://$VPN_SUBDOMAIN.$DOMAIN resolves to this host and serves a valid certificate: curl -sS -o /dev/null -w '%{http_code}\\n' https://$VPN_SUBDOMAIN.$DOMAIN/health"; return 1; }
   return 0
 }
 
@@ -626,7 +665,7 @@ Run this on ${SSH_TARGET:-this host}, then come back:
   C=\$(docker ps -qf name=${VPN_STACK}_core)
   docker exec \$C headscale users list          # note the id of $MESH_USER
   docker exec \$C headscale preauthkeys create --user <id> --reusable --expiration 1h
-  sudo tailscale up --login-server https://$VPN_SUBDOMAIN.$DOMAIN --authkey <key>
+  sudo tailscale up --timeout 45s --login-server https://$VPN_SUBDOMAIN.$DOMAIN --authkey <key>
 
 EOF
   [[ -t 0 ]] || return 1
