@@ -76,8 +76,15 @@ beforehand overrides the stored value.
 | `DOMAIN` | serves `vpn.`, `files.`, `monitor.`, `mcp.` |
 | `MANAGER_HOSTNAME` | the `node.hostname ==` placement constraint |
 | `MESH_ADDR` | this node's mesh address; the NFS server binds it |
+| `MESH_CIDR` | range headscale hands out **and** the NFS export admits |
 | `HEADPLANE_API_KEY` | minted in headplane, so blank on a first run |
 | `HEADPLANE_COOKIE_SECRET` | generated if you accept the default |
+
+`MESH_CIDR` lands in two places that have to agree: headscale's
+`prefixes.v4`, which decides what addresses exist, and the NFS export's client
+spec, which decides who may mount. Set them apart and worker nodes get
+addresses the export silently refuses. The config stage also rejects a
+`MESH_ADDR` outside `MESH_CIDR`, since headscale would never hand it out.
 
 These reach the stacks two different ways. Compose files use `${DOMAIN:-…}`
 interpolation, so a manual `docker stack deploy` still works and falls back to

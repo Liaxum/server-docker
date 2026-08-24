@@ -123,6 +123,20 @@ ask() {
   export "$var=$reply"
 }
 
+# Is an IPv4 address inside a CIDR? Returns 2 when the inputs are not plain
+# IPv4, so callers can skip the check rather than reject an IPv6 setup.
+cidr_contains() {
+  local cidr="$1" addr="$2" base bits mask
+  base="${cidr%/*}"; bits="${cidr#*/}"
+  [[ "$base" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && "$addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 2
+  [[ "$bits" =~ ^[0-9]+$ ]] && (( bits <= 32 )) || return 2
+  local -a b a
+  IFS=. read -r -a b <<< "$base"
+  IFS=. read -r -a a <<< "$addr"
+  mask=$(( bits == 0 ? 0 : (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+  (( ((b[0]<<24|b[1]<<16|b[2]<<8|b[3]) & mask) == ((a[0]<<24|a[1]<<16|a[2]<<8|a[3]) & mask) ))
+}
+
 # Substitute the settings into a *.template file. Deliberately not envsubst:
 # gettext is not installed everywhere, and the placeholder set is fixed.
 render() {
@@ -131,6 +145,7 @@ render() {
   sed -e "s|\${DOMAIN}|$DOMAIN|g" \
       -e "s|\${MANAGER_HOSTNAME}|$MANAGER_HOSTNAME|g" \
       -e "s|\${MESH_ADDR}|$MESH_ADDR|g" \
+      -e "s|\${MESH_CIDR}|$MESH_CIDR|g" \
       -e "s|\${HEADPLANE_API_KEY}|$HEADPLANE_API_KEY|g" \
       -e "s|\${HEADPLANE_COOKIE_SECRET}|$HEADPLANE_COOKIE_SECRET|g" \
       "$template" > "$out"
@@ -140,9 +155,16 @@ render() {
 # Pull in stored answers. Runs before any stage, so --only/--from still see
 # the settings without re-running the config stage.
 load_env() {
-  # shellcheck source=/dev/null
-  [[ -f "$ENV_FILE" ]] && { set -a; source "$ENV_FILE"; set +a; }
-  return 0
+  [[ -f "$ENV_FILE" ]] || return 0
+  local line key val
+  # Parsed rather than sourced: a value already exported must win over the
+  # stored one, and nothing in this file should be able to execute.
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+    key="${line%%=*}"; val="${line#*=}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    [[ -n "${!key:-}" ]] || export "$key=$val"
+  done < "$ENV_FILE"
 }
 
 # Stages that interpolate settings into compose files or rendered configs need
@@ -150,7 +172,7 @@ load_env() {
 # deploy someone else's domain.
 require_settings() {
   local v
-  for v in DOMAIN MANAGER_HOSTNAME MESH_ADDR; do
+  for v in DOMAIN MANAGER_HOSTNAME MESH_ADDR MESH_CIDR; do
     [[ -n "${!v:-}" ]] || die "$v is not set. Run '$0 --only config' first, or export it."
     export "$v=${!v}"
   done
@@ -165,6 +187,13 @@ stage_config() {
   ask DOMAIN           "Domain serving the stacks"       "liaxum.fr"
   ask MANAGER_HOSTNAME "Hostname of the manager node"    "$(hostname)"
   ask MESH_ADDR        "This node's address on the mesh" "100.64.0.1"
+  # Headscale hands out addresses from this range and the NFS export admits
+  # that same range, so the two have to be set together.
+  ask MESH_CIDR        "Address range headscale hands out" "100.64.0.0/10"
+
+  if ! cidr_contains "$MESH_CIDR" "$MESH_ADDR"; then
+    (( $? == 2 )) || die "MESH_ADDR $MESH_ADDR is outside MESH_CIDR $MESH_CIDR: headscale would never hand out that address, and the NFS export would refuse it."
+  fi
 
   # Minted in headplane; see its docs. Left empty until headscale exists, so a
   # first run can get as far as deploying headscale and come back to it.
@@ -180,6 +209,7 @@ stage_config() {
 DOMAIN=$DOMAIN
 MANAGER_HOSTNAME=$MANAGER_HOSTNAME
 MESH_ADDR=$MESH_ADDR
+MESH_CIDR=$MESH_CIDR
 HEADPLANE_API_KEY=$HEADPLANE_API_KEY
 HEADPLANE_COOKIE_SECRET=$HEADPLANE_COOKIE_SECRET
 EOF

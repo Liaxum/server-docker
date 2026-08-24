@@ -46,8 +46,10 @@ services:
       # /shared IS the root, clients address paths relative to it:
       # /shared/monitor-keys on the server is :/monitor-keys to a client.
       #
-      # Two client specs: 100.64.0.0/10 for worker nodes arriving over
-      # Tailscale, 172.16.0.0/12 for the VPS mounting its own export through
+      # Two client specs: MESH_CIDR for worker nodes arriving over Tailscale
+      # -- it must match headscale prefixes.v4, or nodes get addresses this
+      # export refuses -- and 172.16.0.0/12 for the VPS mounting its own
+      # export through
       # the published port, where the source address is NAT'd to the Docker
       # bridge gateway. The listener is bound to 100.64.0.1, so the second
       # spec is reachable only from this host and its containers.
@@ -59,7 +61,7 @@ services:
       #
       # Squashing to root lets a client create setuid-root files on the share,
       # so every client mounts it nosuid,nodev. Nothing here is executed.
-      - "NFS_EXPORT_0=/shared 100.64.0.0/10(rw,sync,no_subtree_check,all_squash,anonuid=0,anongid=0,fsid=0) 172.16.0.0/12(rw,sync,no_subtree_check,all_squash,anonuid=0,anongid=0,fsid=0)"
+      - "NFS_EXPORT_0=/shared ${MESH_CIDR:-100.64.0.0/10}(rw,sync,no_subtree_check,all_squash,anonuid=0,anongid=0,fsid=0) 172.16.0.0/12(rw,sync,no_subtree_check,all_squash,anonuid=0,anongid=0,fsid=0)"
 
 volumes:
   nfs_data:
