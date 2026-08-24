@@ -379,7 +379,15 @@ stage_host() {
 
 stage_swarm() {
   info "swarm resources"
-  swarm_active || die "this node is not in a swarm (run with --with-host-setup)"
+  if ! swarm_active; then
+    # Say which daemon was asked and what it answered: the usual cause is
+    # docker pointing somewhere other than the operator assumes.
+    local endpoint state
+    endpoint="${DOCKER_HOST:-$(docker context show 2>/dev/null || echo default)}"
+    # || true: pipefail would otherwise abort the function before die runs
+    state="$(docker info --format '{{.Swarm.LocalNodeState}}' 2>&1 | tail -1)" || true
+    die "the daemon at $endpoint reports swarm state '${state:-unreachable}'. Run the host stage, which offers to initialise a swarm, or check that --ssh/DOCKER_HOST points where you think."
+  fi
 
   if net_exists web-net; then
     skip "network web-net exists"
