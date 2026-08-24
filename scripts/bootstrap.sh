@@ -633,7 +633,7 @@ ensure_headplane_key() {
   out="$(host_eval "docker exec $container headscale apikeys create --expiration 90d 2>&1")" || true
   # The key is printed alone on a line; take the longest token that carries the
   # prefix.secret shape rather than anything long-ish in a log line.
-  key="$(printf '%s' "$out" | tr -d '\r' | grep -Eo '[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{20,}' | tail -1)"
+  key="$(printf '%s' "$out" | tr -d '\r' | grep -Eo '[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{20,}' | tail -1)" || true
   [[ -n "$key" ]] || key="$(printf '%s' "$out" | tr -d '\r' | grep -Eo '^[A-Za-z0-9_.-]{30,}$' | tail -1)"
   if [[ -z "$key" ]]; then
     warn "could not mint a headplane API key. headscale said:"
@@ -682,17 +682,22 @@ stage_vpn() {
 headscale_user_id() {
   local container="$1" name="$2" out id
 
+  # Every pipeline here is guarded with "|| true": a grep that matches nothing
+  # exits non-zero, and under set -e with pipefail that aborts this function
+  # before the next parser runs -- on bash 3.2, which macOS ships, though not
+  # on bash 5. Three fixes to this function appeared to do nothing because of
+  # exactly that.
   # Newer builds can emit json...
   out="$(host_eval "docker exec $container headscale users list --output json 2>/dev/null")" || out=""
   id="$(printf '%s' "$out" | tr '{' '\n' | grep "\"name\":\"$name\"" \
-        | grep -o '"id":"\?[0-9]\+' | grep -o '[0-9]\+' | head -1)"
+        | grep -o '"id":"\?[0-9]\+' | grep -o '[0-9]\+' | head -1)" || true
   [[ -n "$id" ]] && { printf '%s' "$id"; return 0; }
 
   # ...and every build prints a table: "1 | admin | 2026-08-24". Take the
   # leading id from the row whose name column matches.
   out="$(host_eval "docker exec $container headscale users list 2>/dev/null")" || out=""
   id="$(printf '%s' "$out" | awk -v n="$name" -F'[|[:space:]]+' \
-        '{ for (i = 1; i <= NF; i++) if ($i == n && $1 ~ /^[0-9]+$/) { print $1; exit } }' | head -1)"
+        '{ for (i = 1; i <= NF; i++) if ($i == n && $1 ~ /^[0-9]+$/) { print $1; exit } }' | head -1)" || true
   [[ -n "$id" ]] && { printf '%s' "$id"; return 0; }
 
   # Neither shape matched, which means an output we do not parse. A fresh
@@ -700,7 +705,7 @@ headscale_user_id() {
   # -- and stays right if that user is not number one. Two or more, and we
   # would be guessing, so we do not.
   local ids count
-  ids="$(printf '%s' "$out" | grep -oE '^[[:space:]]*[0-9]+[[:space:]]*\|' | tr -cd '0-9\n')"
+  ids="$(printf '%s' "$out" | grep -oE '^[[:space:]]*[0-9]+[[:space:]]*\|' | tr -cd '0-9\n')" || true
   count="$(printf '%s\n' "$ids" | grep -c '[0-9]' || true)"
   if [[ "$count" == "1" ]]; then
     printf '%s' "$(printf '%s' "$ids" | tr -d '[:space:]')"
@@ -749,10 +754,10 @@ join_mesh() {
   # Keep stderr: when this fails it is the only thing that explains why, and
   # headscale's CLI has changed shape across releases.
   out="$(host_eval "docker exec $container headscale preauthkeys create --user $ref --reusable --expiration 1h --output json 2>&1")" || true
-  key="$(printf '%s' "$out" | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)"
+  key="$(printf '%s' "$out" | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)" || true
   if [[ -z "$key" ]]; then
     out="$(host_eval "docker exec $container headscale preauthkeys create --user $ref --reusable --expiration 1h 2>&1")" || true
-    key="$(printf '%s' "$out" | tail -1 | tr -d '[:space:]')"
+    key="$(printf '%s' "$out" | tail -1 | tr -d '[:space:]')" || true
     # A usable key is a long opaque token; anything else is an error message.
     [[ "$key" =~ ^[A-Za-z0-9]{20,}$ ]] || key=""
   fi
@@ -792,7 +797,7 @@ join_mesh() {
   # talked to headscale, so approve it rather than giving up.
   local status authreq
   status="$(host_eval 'tailscale status 2>&1')" || true
-  authreq="$(printf '%s' "$status" | grep -o 'hskey-authreq-[A-Za-z0-9_-]*' | head -1)"
+  authreq="$(printf '%s' "$status" | grep -o 'hskey-authreq-[A-Za-z0-9_-]*' | head -1)" || true
 
   if [[ -n "$authreq" ]]; then
     info "headscale asked for this node to be registered; approving it as user $ref"
@@ -901,7 +906,7 @@ stage_verify() {
   for svc in "${TRAEFIK_STACK}_core" "${VPN_STACK}_core" "${VPN_STACK}_web" \
              "${FILES_STACK}_core" "${MONITOR_STACK}_db" "${MONITOR_STACK}_core" \
              "${MONITOR_STACK}_agent" "${MONITOR_STACK}_mcp"; do
-    replicas="$(docker service ls --filter "name=$svc" --format '{{.Replicas}}' 2>/dev/null | head -1)"
+    replicas="$(docker service ls --filter "name=$svc" --format '{{.Replicas}}' 2>/dev/null | head -1)" || true
     if [[ -z "$replicas" ]]; then
       warn "$svc: not deployed"
       failed=1
@@ -998,7 +1003,7 @@ undo_host() {
     fi
   fi
 
-  was="$(printf '%s\n' "$state" | grep -m1 '^hostname_was ' | cut -d' ' -f2-)"
+  was="$(printf '%s\n' "$state" | grep -m1 '^hostname_was ' | cut -d' ' -f2-)" || true
   if [[ -n "$was" ]]; then
     if host_eval 'command -v hostnamectl >/dev/null 2>&1'; then
       host_run "sudo hostnamectl set-hostname $was"
