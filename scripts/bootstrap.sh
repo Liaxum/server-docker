@@ -37,12 +37,18 @@ STAGES=(config host swarm traefik vpn mesh nfs filebrowser monitor verify)
 # Answers live here. It holds headplane's API key, so keep it out of git.
 ENV_FILE="${ENV_FILE:-bootstrap.env}"
 
+# What this script changed on the target host, so --uninstall --with-host can
+# reverse exactly that and nothing else. Anything that was already there when
+# we arrived is never recorded, and so is never removed.
+STATE_FILE="${STATE_FILE:-/var/lib/server-docker-bootstrap.state}"
+
 WITH_HOST_SETUP=0
 RECONFIGURE=0
 SSH_TARGET=""
 RESET_CONFIG=0
 UNINSTALL=0
 WITH_DATA=0
+WITH_HOST=0
 DRY_RUN=0
 FROM_STAGE=""
 ONLY_STAGE=""
@@ -90,6 +96,7 @@ while (( $# )); do
     --reset-config)    RESET_CONFIG=1 ;;
     --uninstall)       UNINSTALL=1 ;;
     --with-data)       WITH_DATA=1 ;;
+    --with-host)       WITH_HOST=1 ;;
     --ssh)             SSH_TARGET="${2:?--ssh needs user@host}"; shift ;;
     --dry-run)         DRY_RUN=1 ;;
     --from)            FROM_STAGE="${2:?--from needs a stage}"; shift ;;
@@ -400,6 +407,19 @@ blocker() {
   die "$*"
 }
 
+# Note a host change we made, so it can be undone later.
+record() {
+  (( DRY_RUN )) && return 0
+  host_run "printf '%s\n' '$1' | sudo tee -a $STATE_FILE >/dev/null" || true
+}
+
+recorded() { host_eval "sudo grep -qxF '$1' $STATE_FILE 2>/dev/null"; }
+
+# The value recorded after a key, e.g. "hostname_was ubuntu" -> ubuntu.
+recorded_value() {
+  host_eval "sudo grep -m1 '^$1 ' $STATE_FILE 2>/dev/null" | cut -d' ' -f2-
+}
+
 # Ask a yes/no question. Returns false when there is no terminal, so
 # non-interactive runs fall through to the explicit failure instead of
 # hanging or silently changing a host.
@@ -440,6 +460,7 @@ ensure_hostname() {
     host_run "printf '%s\\n' $MANAGER_HOSTNAME | sudo tee /etc/hostname >/dev/null && sudo hostname $MANAGER_HOSTNAME"
   fi
   # Without this, every later sudo prints "unable to resolve host".
+  record "hostname_was $current"
   host_run "grep -qw $MANAGER_HOSTNAME /etc/hosts || printf '127.0.1.1 %s\\n' $MANAGER_HOSTNAME | sudo tee -a /etc/hosts >/dev/null"
 }
 
@@ -452,8 +473,10 @@ ensure_nfs_client() {
 
   if host_eval 'command -v apt-get >/dev/null 2>&1'; then
     host_run 'sudo apt-get update && sudo apt-get install -y nfs-common'
+    record "installed_package apt-get nfs-common"
   elif host_eval 'command -v pacman >/dev/null 2>&1'; then
     host_run 'sudo pacman -S --needed --noconfirm nfs-utils'
+    record "installed_package pacman nfs-utils"
   else
     die "cannot install NFS client utilities on $where: neither apt-get nor pacman found"
   fi
@@ -470,6 +493,7 @@ ensure_swarm() {
   else
     host_run 'docker swarm init'
   fi
+  record "swarm_init"
 }
 
 ensure_vpn_dir() {
@@ -480,6 +504,7 @@ ensure_vpn_dir() {
     || { blocker "/opt/vpn/data does not exist on $where. Create it, or re-run with --with-host-setup."; return; }
 
   host_run 'sudo mkdir -p /opt/vpn/data'
+  record "created_dir /opt/vpn/data"
 }
 
 ensure_ufw_rule() {
@@ -651,6 +676,7 @@ join_mesh() {
     may_fix "tailscale is not installed on $where. Install it (runs Tailscale's installer: curl -fsSL https://tailscale.com/install.sh | sh)?" \
       || return 1
     host_run 'curl -fsSL https://tailscale.com/install.sh | sh'
+    record "installed_tailscale"
   fi
 
   container="$(host_eval "docker ps -qf name=${VPN_STACK}_core | head -1")" || container=""
@@ -817,7 +843,7 @@ do_reset_config() {
   for f in "$ENV_FILE" apps/vpn/config.yaml apps/vpn/headplane_config.yaml; do
     if [[ -f "$f" ]]; then
       run rm -f "$f"
-      ok "removed $f"
+      (( DRY_RUN )) || ok "removed $f"
       removed=1
     else
       skip "$f is not there"
@@ -825,6 +851,60 @@ do_reset_config() {
   done
   (( removed )) && printf '    Run the script again to answer afresh.\n'
   return 0
+}
+
+# Undo the host changes this script recorded making, newest concern first.
+# Nothing that was already present when we arrived was recorded, so nothing
+# that predates the bootstrap is touched.
+undo_host() {
+  local state pm pkg was
+  state="$(host_eval "sudo cat $STATE_FILE 2>/dev/null")" || state=""
+  if [[ -z "$state" ]]; then
+    skip "no record of host changes; nothing to undo"
+    return 0
+  fi
+
+  printf '    this script recorded making these changes:\n'
+  printf '%s\n' "$state" | sed 's/^/      /'
+
+  if grep -qx 'installed_tailscale' <<< "$state"; then
+    host_run 'sudo tailscale down 2>/dev/null; sudo tailscale logout 2>/dev/null' || true
+    host_run 'sudo apt-get purge -y tailscale tailscale-archive-keyring 2>/dev/null || sudo pacman -Rns --noconfirm tailscale 2>/dev/null' || true
+    host_run 'sudo rm -f /etc/apt/sources.list.d/tailscale.list /usr/share/keyrings/tailscale-archive-keyring.gpg' || true
+  fi
+
+  # After the stacks are gone, so nothing is scheduled onto a dying swarm.
+  if grep -qx 'swarm_init' <<< "$state"; then
+    host_run 'docker swarm leave --force' || true
+  fi
+
+  while read -r _ pm pkg; do
+    [[ -n "${pkg:-}" ]] || continue
+    case "$pm" in
+      apt-get) host_run "sudo apt-get purge -y $pkg && sudo apt-get autoremove -y" || true ;;
+      pacman)  host_run "sudo pacman -Rns --noconfirm $pkg" || true ;;
+    esac
+  done < <(grep '^installed_package ' <<< "$state" || true)
+
+  if grep -qx 'created_dir /opt/vpn/data' <<< "$state"; then
+    if (( WITH_DATA )); then
+      host_run 'sudo rm -rf /opt/vpn/data'
+    else
+      skip "/opt/vpn/data kept (holds headscale's database; --with-data removes it)"
+    fi
+  fi
+
+  was="$(printf '%s\n' "$state" | grep -m1 '^hostname_was ' | cut -d' ' -f2-)"
+  if [[ -n "$was" ]]; then
+    if host_eval 'command -v hostnamectl >/dev/null 2>&1'; then
+      host_run "sudo hostnamectl set-hostname $was"
+    else
+      host_run "printf '%s\n' $was | sudo tee /etc/hostname >/dev/null && sudo hostname $was"
+    fi
+  fi
+
+  host_run "sudo rm -f $STATE_FILE"
+  ok "host changes undone"
 }
 
 # Remove what this script created. Host changes -- packages, the hostname,
@@ -846,6 +926,11 @@ do_uninstall() {
   printf '    secrets: liaxum_crt liaxum_key\n'
   printf '    configs: traefik_dynamic, and the vpn config objects\n'
   printf '    local:   %s and the rendered vpn configs\n' "$ENV_FILE"
+  if (( WITH_HOST )); then
+    printf '    %shost:    packages, swarm membership, tailscale and the hostname this script changed%s\n' "$RED" "$OFF"
+  else
+    printf '    host:    untouched (pass --with-host to undo what this script changed)\n'
+  fi
   if (( WITH_DATA )); then
     printf '    %svolumes: %s%s\n' "$RED" "${volumes[*]}" "$OFF"
     printf '    %sthis destroys the komodo database, the keys and the shared files%s\n' "$RED" "$OFF"
@@ -894,6 +979,8 @@ do_uninstall() {
     done
     warn "volumes on other nodes are not reachable from here; remove ${MONITOR_STACK}_keys on each worker"
   fi
+
+  (( WITH_HOST )) && undo_host
 
   # Last, because everything above needs the settings to know what to remove.
   do_reset_config

@@ -159,10 +159,29 @@ before doing anything and asks you to type the manager hostname; without a
 terminal to ask on, it refuses. Volumes are kept unless `--with-data` is
 given, which destroys the Komodo database, the keys and the shared files.
 
-What it will not undo: packages it installed, the hostname it set, Tailscale,
-and the swarm itself. Those are the host's, not this script's, and guessing at
-which of them predated the bootstrap is how you break a machine. Volumes on
-worker nodes are also out of reach — remove `<monitor stack>_keys` on each.
+`--with-host` also reverses the host changes: it purges packages it installed,
+leaves the swarm it initialised, removes Tailscale it installed, and restores
+the hostname it changed.
+
+It can do this safely because each of those is **recorded when it is made**, in
+`/var/lib/server-docker-bootstrap.state` on the target:
+
+```
+hostname_was ubuntu
+installed_package apt-get nfs-common
+swarm_init
+created_dir /opt/vpn/data
+installed_tailscale
+```
+
+Only recorded changes are undone. A package that was already installed, a
+swarm that already existed, a hostname nobody changed — none of it is
+recorded, so none of it is touched. The record is printed before the reversal
+runs, so you can see exactly what is about to be undone. `/opt/vpn/data` is
+kept unless `--with-data` is given, since it holds headscale's database.
+
+Volumes on worker nodes remain out of reach — remove `<monitor stack>_keys`
+on each.
 
 ### Settings
 
