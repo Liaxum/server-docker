@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Bring the liaxum-vps manager node up from nothing, in dependency order.
+# Bring the manager node up from nothing, in dependency order.
 #
 # The order is not arbitrary. Headscale hands out the 100.64.0.1 address that
 # the NFS server binds to, and the Komodo keys volume mounts that export, so
@@ -265,8 +265,8 @@ stage_config() {
   ask MONITOR_SUBDOMAIN  "Subdomain for komodo"        "monitor"
   ask MCP_SUBDOMAIN      "Subdomain for the komodo MCP server" "mcp"
 
-  ask CRT_FILE "TLS certificate file" "$(detect_pem cert || echo "$CERT_DIR/liaxum.pem")"
-  ask KEY_FILE "TLS private key file" "$(detect_pem key  || echo "$CERT_DIR/liaxum.key")"
+  ask CRT_FILE "TLS certificate file" "$(detect_pem cert || echo "$CERT_DIR/certificate.pem")"
+  ask KEY_FILE "TLS private key file" "$(detect_pem key  || echo "$CERT_DIR/private.key")"
 
   ask HEADPLANE_API_KEY       "Headplane API key (blank to fill in later)" "" "" optional
   ask HEADPLANE_COOKIE_SECRET "Headplane cookie secret" "$(openssl rand -hex 16 2>/dev/null || head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
@@ -308,11 +308,14 @@ detect_pem() {
   local kind="$1" f
   local -a candidates
   have openssl || return 1
-  # Preference matters when several files parse: this repo's convention is to
-  # convert the CA's .cer/.key into .pem before use, so .pem wins.
+  # Preference matters when several files parse. Name hints come first, then
+  # .pem -- this repo converts the CA's .cer/.key into .pem before use. A hint
+  # only reorders the search; openssl still decides what each file is, so a
+  # "certificate-key.pem" caught by *cert* is rejected and the scan continues.
   case "$kind" in
-    cert) candidates=("$CERT_DIR"/*.pem "$CERT_DIR"/*.crt "$CERT_DIR"/*.cer "$CERT_DIR"/*) ;;
-    key)  candidates=("$CERT_DIR"/*.key "$CERT_DIR"/*.pem "$CERT_DIR"/*) ;;
+    cert) candidates=("$CERT_DIR"/*cert* "$CERT_DIR"/*fullchain* "$CERT_DIR"/*.pem \
+                      "$CERT_DIR"/*.crt "$CERT_DIR"/*.cer "$CERT_DIR"/*) ;;
+    key)  candidates=("$CERT_DIR"/*private* "$CERT_DIR"/*.key "$CERT_DIR"/*.pem "$CERT_DIR"/*) ;;
   esac
   for f in "${candidates[@]}"; do
     [[ -f "$f" ]] || continue
