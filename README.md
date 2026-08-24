@@ -260,6 +260,14 @@ If you later change a volume's `device` or `o` options, remember Docker pins
 `driver_opts` at volume creation: the volume must be removed on every node
 before the new options take effect.
 
+Docker config and secret objects are immutable in the same way — redeploying
+with changed content fails with `only updates to Labels are allowed`. The vpn
+stack therefore names its configs after a hash of their contents, so a change
+creates a new object rather than trying to rewrite one. Superseded objects are
+left behind; `docker config ls` shows them and unreferenced ones can be
+removed. Secrets have no such escape here, so rotating a certificate still
+means removing the secret and redeploying Traefik.
+
 ## Design decisions
 
 ### Hybrid local + NFS volume model

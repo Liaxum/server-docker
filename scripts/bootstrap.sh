@@ -187,6 +187,15 @@ cidr_contains() {
   (( ((b[0]<<24|b[1]<<16|b[2]<<8|b[3]) & mask) == ((a[0]<<24|a[1]<<16|a[2]<<8|a[3]) & mask) ))
 }
 
+# Short content hash, used to name docker config objects. sha256sum is
+# coreutils, shasum comes with macOS -- this runs wherever the CLI does.
+file_hash() {
+  if have sha256sum;  then sha256sum "$1" | cut -c1-12
+  elif have shasum;   then shasum -a 256 "$1" | cut -c1-12
+  else openssl dgst -sha256 "$1" | awk '{print substr($NF, 1, 12)}'
+  fi
+}
+
 # Substitute the settings into a *.template file. Deliberately not envsubst:
 # gettext is not installed everywhere, and the placeholder set is fixed.
 render() {
@@ -584,17 +593,26 @@ ensure_headplane_key() {
   return 0
 }
 
+vpn_config_hashes() {
+  (( DRY_RUN )) && return 0
+  [[ -f apps/vpn/config.yaml ]] && export HEADSCALE_CONFIG_HASH="$(file_hash apps/vpn/config.yaml)"
+  [[ -f apps/vpn/headplane_config.yaml ]] && export HEADPLANE_CONFIG_HASH="$(file_hash apps/vpn/headplane_config.yaml)"
+  return 0
+}
+
 stage_vpn() {
   info "headscale"
   # compose reads these as files, so they are rendered rather than interpolated
   [[ -f apps/vpn/config.yaml.template ]] && render apps/vpn/config.yaml.template
   [[ -f apps/vpn/headplane_config.yaml.template ]] && render apps/vpn/headplane_config.yaml.template
+  vpn_config_hashes
   deploy apps/vpn/compose.yml "$VPN_STACK"
 
   # The key can only be minted once headscale is running, so re-render and
   # redeploy when we get one.
   if ensure_headplane_key; then
     render apps/vpn/headplane_config.yaml.template
+    vpn_config_hashes
     deploy apps/vpn/compose.yml "$VPN_STACK"
   fi
 }
