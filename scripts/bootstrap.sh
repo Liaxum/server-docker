@@ -226,7 +226,7 @@ require_settings() {
   local v
   for v in DOMAIN MANAGER_HOSTNAME MESH_ADDR MESH_CIDR \
            TRAEFIK_STACK VPN_STACK VPN_SUBDOMAIN FILES_STACK FILES_SUBDOMAIN \
-           MONITOR_STACK MONITOR_SUBDOMAIN MCP_SUBDOMAIN CRT_FILE KEY_FILE; do
+           MONITOR_STACK MONITOR_SUBDOMAIN MCP_SUBDOMAIN CRT_FILE KEY_FILE MESH_USER; do
     [[ -n "${!v:-}" ]] || die "$v is not set. Run '$0 --only config' first, or export it."
     export "$v=${!v}"
   done
@@ -268,6 +268,9 @@ stage_config() {
   ask CRT_FILE "TLS certificate file" "$(detect_pem cert || echo "$CERT_DIR/certificate.pem")"
   ask KEY_FILE "TLS private key file" "$(detect_pem key  || echo "$CERT_DIR/private.key")"
 
+  ask MESH_USER "Headscale user to enrol nodes under" "admin"
+  [[ "$MESH_USER" =~ ^[A-Za-z0-9._-]+$ ]] || die "MESH_USER '$MESH_USER' is not a valid name"
+
   ask HEADPLANE_API_KEY       "Headplane API key (blank to fill in later)" "" "" optional
   ask HEADPLANE_COOKIE_SECRET "Headplane cookie secret" "$(openssl rand -hex 16 2>/dev/null || head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
@@ -289,6 +292,7 @@ FILES_SUBDOMAIN=$FILES_SUBDOMAIN
 MONITOR_STACK=$MONITOR_STACK
 MONITOR_SUBDOMAIN=$MONITOR_SUBDOMAIN
 MCP_SUBDOMAIN=$MCP_SUBDOMAIN
+MESH_USER=$MESH_USER
 CRT_FILE=$CRT_FILE
 KEY_FILE=$KEY_FILE
 HEADPLANE_API_KEY=$HEADPLANE_API_KEY
@@ -549,11 +553,45 @@ stage_vpn() {
   deploy apps/vpn/compose.yml "$VPN_STACK"
 }
 
+# Install tailscale, mint a headscale pre-auth key, and join. Each step asks
+# first, so a plain run still lets the operator do it by hand.
+join_mesh() {
+  local where="${SSH_TARGET:-this host}" container key
+
+  if ! host_eval 'command -v tailscale >/dev/null 2>&1'; then
+    may_fix "tailscale is not installed on $where. Install it (runs Tailscale's installer: curl -fsSL https://tailscale.com/install.sh | sh)?" \
+      || return 1
+    host_run 'curl -fsSL https://tailscale.com/install.sh | sh'
+  fi
+
+  container="$(host_eval "docker ps -qf name=${VPN_STACK}_core | head -1")" || container=""
+  [[ -n "$container" ]] || { warn "no ${VPN_STACK}_core container is running, so no pre-auth key can be minted"; return 1; }
+
+  may_fix "Enrol $where in headscale as user '$MESH_USER'?" || return 1
+
+  # Already-exists is the normal case on a re-run, so its failure is not fatal.
+  host_eval "docker exec $container headscale users create $MESH_USER" >/dev/null 2>&1 || true
+
+  # --output json where available; older builds print the key on its own line.
+  key="$(host_eval "docker exec $container headscale preauthkeys create --user $MESH_USER --reusable --expiration 1h --output json 2>/dev/null" \
+        | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)" || key=""
+  if [[ -z "$key" ]]; then
+    key="$(host_eval "docker exec $container headscale preauthkeys create --user $MESH_USER --reusable --expiration 1h 2>/dev/null" \
+          | tail -1 | tr -d '[:space:]')" || key=""
+  fi
+  [[ -n "$key" ]] || { warn "could not mint a pre-auth key from $container"; return 1; }
+
+  # The key is short-lived, but keep it off the terminal all the same.
+  host_run "sudo tailscale up --login-server https://$VPN_SUBDOMAIN.$DOMAIN --authkey $key >/dev/null" \
+    || { warn "tailscale up failed; is https://$VPN_SUBDOMAIN.$DOMAIN resolving and serving a valid certificate?"; return 1; }
+  return 0
+}
+
 stage_mesh() {
   info "mesh address"
 
   if (( DRY_RUN )); then
-    skip "would check that $MESH_ADDR is assigned to this host"
+    skip "would check that $MESH_ADDR is assigned to ${SSH_TARGET:-this host}, and offer to join if not"
     return
   fi
 
@@ -567,23 +605,27 @@ stage_mesh() {
     return
   fi
 
-  # Joining is interactive, or needs a pre-auth key minted inside headscale.
-  # Automating it would mean generating keys on every run, so stop instead.
-  # container_name is ignored by swarm, so the container is <stack>_core.N.<id>
-  # and "docker exec headscale" would not find it.
-  host_eval 'command -v tailscale >/dev/null 2>&1' \
-    || warn "tailscale is not installed on ${SSH_TARGET:-this host}, so the last step below will not run yet. Tailscale's own installer is: curl -fsSL https://tailscale.com/install.sh | sh"
+  if join_mesh; then
+    local got
+    got="$(host_eval 'tailscale ip -4 2>/dev/null | head -1' | tr -d '[:space:]')" || got=""
+    if [[ "$got" == "$MESH_ADDR" ]]; then
+      ok "joined the mesh as $MESH_ADDR"
+      return
+    fi
+    # headscale allocates in order, so the address is not ours to choose.
+    die "joined the mesh, but headscale assigned ${got:-no address} rather than $MESH_ADDR. Set MESH_ADDR to $got (re-run with --reconfigure): the NFS server binds it, and the clients mount it."
+  fi
 
   cat >&2 <<EOF
 
 ${SSH_TARGET:-This host} does not hold $MESH_ADDR yet, so the NFS server cannot bind it.
 Join the mesh, then re-run with: $0 --from nfs
 
-On ${SSH_TARGET:-this host}, replacing <user> with a name for yourself:
+On ${SSH_TARGET:-this host}:
 
   C=\$(docker ps -qf name=${VPN_STACK}_core)
-  docker exec \$C headscale users create <user>
-  docker exec \$C headscale preauthkeys create --user <user> --reusable --expiration 1h
+  docker exec \$C headscale users create $MESH_USER
+  docker exec \$C headscale preauthkeys create --user $MESH_USER --reusable --expiration 1h
   sudo tailscale up --login-server https://$VPN_SUBDOMAIN.$DOMAIN --authkey <key>
 
 EOF

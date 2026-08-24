@@ -155,6 +155,7 @@ beforehand overrides the stored value.
 | `*_STACK` | stack names: `TRAEFIK_`, `VPN_`, `FILES_`, `MONITOR_` |
 | `*_SUBDOMAIN` | subdomains: `VPN_`, `FILES_`, `MONITOR_`, `MCP_` |
 | `CRT_FILE` / `KEY_FILE` | TLS material; detected in `traefik/secret/` by content |
+| `MESH_USER` | headscale user that nodes enrol under |
 | `HEADPLANE_API_KEY` | minted in headplane, so blank on a first run |
 | `HEADPLANE_COOKIE_SECRET` | generated if you accept the default |
 
@@ -185,12 +186,18 @@ Before the secrets are created the pair is checked: both PEM, both parseable,
 and the certificate's public key equal to the one the private key derives. A
 mismatched pair otherwise deploys cleanly and fails TLS at runtime.
 
+The `mesh` stage joins the node for you: it offers to install Tailscale, mints
+a headscale pre-auth key through the running `<vpn stack>_core` container, and
+runs `tailscale up`. Each step asks first, so declining still prints the
+commands to run by hand. headscale allocates addresses in order rather than
+letting you pick, so if it hands out something other than `MESH_ADDR` the stage
+stops and tells you what to set — the NFS server binds that address and every
+client mounts it.
+
 Two things it will not do. Certificates: `liaxum_crt` and `liaxum_key` are
 created from `traefik/secret/` (override with `CRT_FILE`/`KEY_FILE`), and
 because Docker secrets are immutable, rotating one means removing the secret
-and redeploying Traefik by hand. Joining the mesh: that needs an interactive
-login or a pre-auth key minted inside headscale, so the `mesh` stage stops and
-prints the three commands rather than generating keys on every run.
+and redeploying Traefik by hand. and rotating one means removing the secret and redeploying Traefik by hand.
 
 The stages are `host swarm traefik vpn mesh nfs filebrowser monitor verify`.
 
