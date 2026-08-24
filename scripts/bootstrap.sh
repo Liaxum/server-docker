@@ -948,10 +948,14 @@ do_uninstall() {
     fi
   fi
 
-  for st in "${present[@]}"; do run docker stack rm "$st"; done
+  # Guarded: bash 3.2, which macOS still ships, treats "${empty[@]}" as an
+  # unbound variable under set -u.
+  if (( ${#present[@]} > 0 )); then
+    for st in "${present[@]}"; do run docker stack rm "$st"; done
+  fi
 
   # Networks and volumes stay busy until the tasks actually stop.
-  if (( ! DRY_RUN )) && (( ${#present[@]} )); then
+  if (( ! DRY_RUN )) && (( ${#present[@]} > 0 )); then
     printf '    waiting for tasks to stop' >&2
     local i
     for i in $(seq 1 30); do
