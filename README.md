@@ -57,6 +57,7 @@ safe to re-run — every stage checks before it acts.
 ./scripts/bootstrap.sh --with-host-setup  # also prepare the host (needs sudo)
 ./scripts/bootstrap.sh --from nfs         # resume from a stage
 ./scripts/bootstrap.sh --dry-run          # print what would run
+./scripts/bootstrap.sh --ssh user@host    # repo here, cluster there
 ```
 
 Without `--with-host-setup` it touches nothing outside Docker: it checks the
@@ -114,7 +115,23 @@ docker-facing stage then works: bind mounts like `/opt/vpn/data` and the
 Two stages do not, because they inspect or modify the host rather than Docker:
 `--with-host-setup` installs packages and edits ufw, and `mesh` checks which
 addresses this machine holds. Both refuse to run against a remote daemon
-rather than acting on the wrong machine — run them on the manager itself.
+rather than acting on the wrong machine.
+
+`--ssh` covers that gap, and is the simpler way to work from a laptop:
+
+```bash
+./scripts/bootstrap.sh --ssh liaxum-vps --with-host-setup
+```
+
+It points Docker at that host *and* runs the host-local stages there over ssh,
+so one flag makes every stage work with the repo on this machine. It also
+defaults `MANAGER_HOSTNAME` to the target rather than your laptop — otherwise
+the `node.hostname ==` constraint would name a machine that is not in the
+swarm, and every pinned service would sit unschedulable.
+
+The connection is checked once up front, so an unreachable host fails as a
+connection error instead of surfacing as a missing package or an absent
+directory in every later check. `sudo` gets a terminal, so it can prompt.
 
 ### Settings
 

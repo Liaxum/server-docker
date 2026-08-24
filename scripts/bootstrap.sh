@@ -9,6 +9,7 @@
 #   ./scripts/bootstrap.sh                      # deploy, host must be ready
 #   ./scripts/bootstrap.sh --with-host-setup    # also prepare the host (sudo)
 #   ./scripts/bootstrap.sh --reconfigure        # re-ask the settings
+#   ./scripts/bootstrap.sh --ssh user@host      # repo here, cluster there
 #   ./scripts/bootstrap.sh --from nfs           # resume from a stage
 #   ./scripts/bootstrap.sh --only monitor       # run a single stage
 #   ./scripts/bootstrap.sh --dry-run            # print what would run
@@ -17,6 +18,10 @@
 # headplane's credentials -- are asked once and kept in bootstrap.env, which is
 # gitignored. Answers are reused on later runs unless --reconfigure is passed;
 # exporting a variable beforehand overrides the stored value.
+#
+# --ssh keeps the repo on this machine and puts the cluster on another: docker
+# commands go to that host's daemon, and the stages that inspect or change the
+# host itself run there over ssh rather than here.
 #
 # Every stage is idempotent: re-running is always safe.
 
@@ -32,6 +37,7 @@ ENV_FILE="${ENV_FILE:-bootstrap.env}"
 
 WITH_HOST_SETUP=0
 RECONFIGURE=0
+SSH_TARGET=""
 DRY_RUN=0
 FROM_STAGE=""
 ONLY_STAGE=""
@@ -75,6 +81,7 @@ while (( $# )); do
   case "$1" in
     --with-host-setup) WITH_HOST_SETUP=1 ;;
     --reconfigure)     RECONFIGURE=1 ;;
+    --ssh)             SSH_TARGET="${2:?--ssh needs user@host}"; shift ;;
     --dry-run)         DRY_RUN=1 ;;
     --from)            FROM_STAGE="${2:?--from needs a stage}"; shift ;;
     --only)            ONLY_STAGE="${2:?--only needs a stage}"; shift ;;
@@ -83,6 +90,18 @@ while (( $# )); do
   esac
   shift
 done
+
+# Fail on the connection itself rather than letting every later check come
+# back false and get reported as a missing package or an absent directory.
+if [[ -n "$SSH_TARGET" ]]; then
+  have ssh || die "--ssh needs an ssh client on this machine"
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$SSH_TARGET" true 2>/dev/null \
+    || die "cannot reach $SSH_TARGET over ssh without a password. Check the host, and that your key is loaded."
+fi
+
+# Point the docker CLI at the target's daemon. Compose files are still read
+# here -- only the resulting spec crosses the wire.
+[[ -n "$SSH_TARGET" ]] && export DOCKER_HOST="ssh://$SSH_TARGET"
 
 for s in ${FROM_STAGE:-} ${ONLY_STAGE:-}; do
   [[ " ${STAGES[*]} " == *" $s "* ]] || die "unknown stage: $s (have: ${STAGES[*]})"
@@ -123,11 +142,30 @@ ask() {
   export "$var=$reply"
 }
 
+# Read-only check on the target host. Always executes, including under
+# --dry-run: stage logic depends on the answer.
+host_eval() {
+  if [[ -n "$SSH_TARGET" ]]; then ssh -o BatchMode=yes "$SSH_TARGET" "$1"; else eval "$1"; fi
+}
+
+# Mutating command on the target host. Honours --dry-run, and asks for a
+# terminal when remote so sudo can prompt.
+host_run() {
+  if (( DRY_RUN )); then
+    printf '    would run%s: %s\n' "${SSH_TARGET:+ on $SSH_TARGET}" "$1"
+    return
+  fi
+  if [[ -n "$SSH_TARGET" ]]; then ssh -t "$SSH_TARGET" "$1"; else eval "$1"; fi
+}
+
 # True when the docker CLI is pointed at a daemon on another machine, e.g.
 # via `docker context use`. Deploys work fine that way -- compose files are
 # read client-side and the spec is sent over -- but anything that inspects or
 # modifies the host would act on the wrong machine.
 docker_is_remote() {
+  # --ssh points the daemon and the host commands at the same machine, so a
+  # remote daemon is expected and not a mistake.
+  [[ -n "$SSH_TARGET" ]] && return 1
   local daemon
   daemon="$(docker info --format '{{.Name}}' 2>/dev/null)" || return 1
   [[ -n "$daemon" ]] || return 1
@@ -200,7 +238,7 @@ stage_config() {
   [[ -f "$ENV_FILE" ]] && skip "loaded $ENV_FILE"
 
   ask DOMAIN           "Domain serving the stacks"       "liaxum.fr"
-  ask MANAGER_HOSTNAME "Hostname of the manager node"    "$(hostname)"
+  ask MANAGER_HOSTNAME "Hostname of the manager node"    "$(host_eval 'hostname -s' 2>/dev/null || hostname)"
   ask MESH_ADDR        "This node's address on the mesh" "100.64.0.1"
   # Headscale hands out addresses from this range and the NFS export admits
   # that same range, so the two have to be set together.
@@ -256,64 +294,67 @@ EOF
 }
 
 stage_host() {
+  local where="${SSH_TARGET:-this machine}"
+
   if (( ! WITH_HOST_SETUP )); then
-    skip "host setup not requested; checking prerequisites instead"
+    skip "host setup not requested; checking prerequisites on $where"
 
-    have mount.nfs4 || die "NFS client utilities missing. Install nfs-common (Debian/Ubuntu) or nfs-utils (Arch), or re-run with --with-host-setup."
-    swarm_active   || die "this node is not in a swarm. Run 'docker swarm init', or re-run with --with-host-setup."
-    [[ -d /opt/vpn/data ]] || die "/opt/vpn/data does not exist (headscale's state directory). Create it, or re-run with --with-host-setup."
+    host_eval 'command -v mount.nfs4 >/dev/null 2>&1' \
+      || die "NFS client utilities missing on $where. Install nfs-common (Debian/Ubuntu) or nfs-utils (Arch), or re-run with --with-host-setup."
+    swarm_active \
+      || die "the target is not in a swarm. Run 'docker swarm init' on it, or re-run with --with-host-setup."
+    host_eval 'test -d /opt/vpn/data' \
+      || die "/opt/vpn/data does not exist on $where (headscale's state directory). Create it, or re-run with --with-host-setup."
 
-    if have ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then
-      ufw status | grep -q '2049.*tailscale0' \
+    if host_eval 'command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active"'; then
+      host_eval 'ufw status | grep -q "2049.*tailscale0"' \
         || warn "no ufw rule allowing 2049 on tailscale0. Local mounts work without it, but worker nodes will not be able to mount the export."
     fi
-    ok "host prerequisites present"
+    ok "host prerequisites present on $where"
     return
   fi
 
-  info "preparing the host (requires sudo)"
+  info "preparing $where (requires sudo)"
 
   if docker_is_remote; then
-    die "docker is pointed at a remote daemon ($(docker info --format '{{.Name}}')), but --with-host-setup installs packages, edits ufw and creates directories on THIS machine. Run it on the manager node itself."
+    die "docker is pointed at a remote daemon ($(docker info --format '{{.Name}}')), but --with-host-setup changes THIS machine. Use --ssh to target that host, or run it there directly."
   fi
 
-  if have mount.nfs4; then
+  if host_eval 'command -v mount.nfs4 >/dev/null 2>&1'; then
     skip "NFS client utilities already installed"
-  elif have apt-get; then
-    run sudo apt-get update
-    run sudo apt-get install -y nfs-common
-  elif have pacman; then
-    run sudo pacman -S --needed --noconfirm nfs-utils
+  elif host_eval 'command -v apt-get >/dev/null 2>&1'; then
+    host_run 'sudo apt-get update && sudo apt-get install -y nfs-common'
+  elif host_eval 'command -v pacman >/dev/null 2>&1'; then
+    host_run 'sudo pacman -S --needed --noconfirm nfs-utils'
   else
-    die "cannot install NFS client utilities: neither apt-get nor pacman found"
+    die "cannot install NFS client utilities on $where: neither apt-get nor pacman found"
   fi
 
   if swarm_active; then
     skip "swarm already initialised"
   elif [[ -n "$SWARM_ADVERTISE_ADDR" ]]; then
-    run docker swarm init --advertise-addr "$SWARM_ADVERTISE_ADDR"
+    host_run "docker swarm init --advertise-addr $SWARM_ADVERTISE_ADDR"
   else
-    run docker swarm init
+    host_run 'docker swarm init'
   fi
 
-  if [[ -d /opt/vpn/data ]]; then
+  if host_eval 'test -d /opt/vpn/data'; then
     skip "/opt/vpn/data exists"
   else
-    run sudo mkdir -p /opt/vpn/data
+    host_run 'sudo mkdir -p /opt/vpn/data'
   fi
 
-  if have ufw && ufw status 2>/dev/null | grep -q '^Status: active'; then
-    if ufw status | grep -q '2049.*tailscale0'; then
+  if host_eval 'command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active"'; then
+    if host_eval 'ufw status | grep -q "2049.*tailscale0"'; then
       skip "ufw already allows 2049 on tailscale0"
     else
-      run sudo ufw allow in on tailscale0 to any port 2049 proto tcp
-      run sudo ufw reload
+      host_run 'sudo ufw allow in on tailscale0 to any port 2049 proto tcp && sudo ufw reload'
     fi
   else
     skip "ufw inactive or absent; nothing to open"
   fi
 
-  ok "host ready"
+  ok "$where ready"
 }
 
 stage_swarm() {
@@ -381,12 +422,12 @@ stage_mesh() {
   fi
 
   if docker_is_remote; then
-    skip "docker is remote; cannot check this host for $MESH_ADDR -- verify on the manager node"
+    skip "docker is remote and --ssh was not given; cannot check for $MESH_ADDR -- verify on the manager node"
     return
   fi
 
-  if ip -4 -oneline addr show 2>/dev/null | grep -qw "$MESH_ADDR"; then
-    ok "$MESH_ADDR is assigned to this host"
+  if host_eval "ip -4 -oneline addr show 2>/dev/null | grep -qw $MESH_ADDR"; then
+    ok "$MESH_ADDR is assigned to ${SSH_TARGET:-this host}"
     return
   fi
 
@@ -394,7 +435,7 @@ stage_mesh() {
   # Automating it would mean generating keys on every run, so stop instead.
   cat >&2 <<EOF
 
-This host does not hold $MESH_ADDR yet, so the NFS server cannot bind it.
+${SSH_TARGET:-This host} does not hold $MESH_ADDR yet, so the NFS server cannot bind it.
 Join the mesh, then re-run with: $0 --from nfs
 
   docker exec headscale headscale users create \$USER
