@@ -675,13 +675,21 @@ stage_vpn() {
 #   invalid argument "admin" for "-u, --user" flag: strconv.ParseUint
 # Older builds take the name. Resolve to an id, and let the caller fall back.
 headscale_user_id() {
-  local container="$1" name="$2"
-  host_eval "docker exec $container headscale users list --output json 2>/dev/null" \
-    | tr '{' '\n' \
-    | grep "\"name\":\"$name\"" \
-    | grep -o '"id":"\?[0-9]\+' \
-    | grep -o '[0-9]\+' \
-    | head -1
+  local container="$1" name="$2" out id
+
+  # Newer builds can emit json...
+  out="$(host_eval "docker exec $container headscale users list --output json 2>/dev/null")" || out=""
+  id="$(printf '%s' "$out" | tr '{' '\n' | grep "\"name\":\"$name\"" \
+        | grep -o '"id":"\?[0-9]\+' | grep -o '[0-9]\+' | head -1)"
+  [[ -n "$id" ]] && { printf '%s' "$id"; return 0; }
+
+  # ...and every build prints a table: "1 | admin | 2026-08-24". Take the
+  # leading id from the row whose name column matches.
+  out="$(host_eval "docker exec $container headscale users list 2>/dev/null")" || out=""
+  id="$(printf '%s' "$out" | awk -v n="$name" -F'[|[:space:]]+' \
+        '{ for (i = 1; i <= NF; i++) if ($i == n && $1 ~ /^[0-9]+$/) { print $1; exit } }' | head -1)"
+  [[ -n "$id" ]] && printf '%s' "$id"
+  return 0
 }
 
 mesh_addr_held() {
@@ -706,11 +714,20 @@ join_mesh() {
   may_fix "Enrol $where in headscale as user '$MESH_USER'?" || return 1
 
   # Already-exists is the normal case on a re-run, so its failure is not fatal.
-  host_eval "docker exec $container headscale users create $MESH_USER" >/dev/null 2>&1 || true
+  local created
+  created="$(host_eval "docker exec $container headscale users create $MESH_USER 2>&1")" || true
 
   local ref
   ref="$(headscale_user_id "$container" "$MESH_USER")"
-  [[ -n "$ref" ]] || ref="$MESH_USER"   # older headscale takes the name
+  if [[ -z "$ref" ]]; then
+    # Falling back to the name only works on headscale < 0.24, so say what was
+    # seen rather than letting the next command fail with a parse error.
+    warn "could not find a user id for '$MESH_USER'. headscale users create said:"
+    printf '%s\n' "${created:-(no output)}" | tail -3 | sed 's/^/      /' >&2
+    warn "and users list said:"
+    host_eval "docker exec $container headscale users list 2>&1" | tail -5 | sed 's/^/      /' >&2
+    ref="$MESH_USER"
+  fi
 
   # Keep stderr: when this fails it is the only thing that explains why, and
   # headscale's CLI has changed shape across releases.
@@ -723,10 +740,12 @@ join_mesh() {
     [[ "$key" =~ ^[A-Za-z0-9]{20,}$ ]] || key=""
   fi
 
+  # A key is the tidy path, not the only one: without one the node asks
+  # headscale to register it, and that request can be approved below.
   if [[ -z "$key" ]]; then
     warn "could not mint a pre-auth key from $container. headscale said:"
-    printf '%s\n' "$out" | tail -5 | sed 's/^/      /' >&2
-    return 1
+    printf '%s\n' "$out" | tail -3 | sed 's/^/      /' >&2
+    warn "joining without one; headscale will be asked to register this node instead"
   fi
 
   # --timeout stops an unreachable control server being retried forever, which
@@ -735,7 +754,7 @@ join_mesh() {
   # handshake, and a first join routinely takes longer than that. So give it
   # room, and treat a timeout as "not yet" rather than "failed": the backend
   # carries on after up returns.
-  host_run "sudo tailscale up --timeout 120s --login-server https://$VPN_SUBDOMAIN.$DOMAIN --authkey $key >/dev/null" || true
+  host_run "sudo tailscale up --timeout 120s --login-server https://$VPN_SUBDOMAIN.$DOMAIN ${key:+--authkey $key} >/dev/null" || true
 
   local i got
   printf '    waiting for an address' >&2
@@ -751,9 +770,36 @@ join_mesh() {
   done
   printf '\n' >&2
 
+  # When headscale does not accept the key it answers with a registration
+  # request and prints how to approve it. Reaching this point means the node
+  # talked to headscale, so approve it rather than giving up.
+  local status authreq
+  status="$(host_eval 'tailscale status 2>&1')" || true
+  authreq="$(printf '%s' "$status" | grep -o 'hskey-authreq-[A-Za-z0-9_-]*' | head -1)"
+
+  if [[ -n "$authreq" ]]; then
+    info "headscale asked for this node to be registered; approving it as user $ref"
+    out="$(host_eval "docker exec $container headscale nodes register --user $ref --key $authreq 2>&1")" || true
+    printf '%s' "$out" | grep -qiE 'error|invalid|usage' \
+      && out="$(host_eval "docker exec $container headscale auth register --auth-id $authreq --user $ref 2>&1")" || true
+    printf '%s\n' "$out" | tail -3 | sed 's/^/      /' >&2
+
+    printf '    waiting for an address' >&2
+    for i in $(seq 1 10); do
+      got="$(host_eval 'tailscale ip -4 2>/dev/null | head -1' | tr -d '[:space:]')" || got=""
+      if [[ -n "$got" ]]; then
+        printf '\n' >&2
+        JOINED_ADDR="$got"
+        return 0
+      fi
+      printf '.' >&2
+      sleep 3
+    done
+    printf '\n' >&2
+  fi
+
   warn "tailscale did not get an address. Its own view of why:"
-  host_eval 'tailscale status 2>&1 | head -5' | sed 's/^/      /' >&2
-  warn "if that mentions certificate or connection trouble, check https://$VPN_SUBDOMAIN.$DOMAIN/health from this host and that the certificate includes its intermediate chain"
+  printf '%s\n' "$status" | head -5 | sed 's/^/      /' >&2
   return 1
 }
 
