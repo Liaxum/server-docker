@@ -553,6 +553,19 @@ stage_vpn() {
   deploy apps/vpn/compose.yml "$VPN_STACK"
 }
 
+# headscale >= 0.24 wants a numeric id for --user and rejects the name:
+#   invalid argument "admin" for "-u, --user" flag: strconv.ParseUint
+# Older builds take the name. Resolve to an id, and let the caller fall back.
+headscale_user_id() {
+  local container="$1" name="$2"
+  host_eval "docker exec $container headscale users list --output json 2>/dev/null" \
+    | tr '{' '\n' \
+    | grep "\"name\":\"$name\"" \
+    | grep -o '"id":"\?[0-9]\+' \
+    | grep -o '[0-9]\+' \
+    | head -1
+}
+
 mesh_addr_held() {
   host_eval "ip -4 -oneline addr show 2>/dev/null | grep -qw $MESH_ADDR"
 }
@@ -576,12 +589,16 @@ join_mesh() {
   # Already-exists is the normal case on a re-run, so its failure is not fatal.
   host_eval "docker exec $container headscale users create $MESH_USER" >/dev/null 2>&1 || true
 
+  local ref
+  ref="$(headscale_user_id "$container" "$MESH_USER")"
+  [[ -n "$ref" ]] || ref="$MESH_USER"   # older headscale takes the name
+
   # Keep stderr: when this fails it is the only thing that explains why, and
   # headscale's CLI has changed shape across releases.
-  out="$(host_eval "docker exec $container headscale preauthkeys create --user $MESH_USER --reusable --expiration 1h --output json 2>&1")" || true
+  out="$(host_eval "docker exec $container headscale preauthkeys create --user $ref --reusable --expiration 1h --output json 2>&1")" || true
   key="$(printf '%s' "$out" | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)"
   if [[ -z "$key" ]]; then
-    out="$(host_eval "docker exec $container headscale preauthkeys create --user $MESH_USER --reusable --expiration 1h 2>&1")" || true
+    out="$(host_eval "docker exec $container headscale preauthkeys create --user $ref --reusable --expiration 1h 2>&1")" || true
     key="$(printf '%s' "$out" | tail -1 | tr -d '[:space:]')"
     # A usable key is a long opaque token; anything else is an error message.
     [[ "$key" =~ ^[A-Za-z0-9]{20,}$ ]] || key=""
@@ -607,8 +624,8 @@ ${SSH_TARGET:-This host} does not hold $MESH_ADDR yet, so the NFS server cannot 
 Run this on ${SSH_TARGET:-this host}, then come back:
 
   C=\$(docker ps -qf name=${VPN_STACK}_core)
-  docker exec \$C headscale users list
-  docker exec \$C headscale preauthkeys create --user $MESH_USER --reusable --expiration 1h
+  docker exec \$C headscale users list          # note the id of $MESH_USER
+  docker exec \$C headscale preauthkeys create --user <id> --reusable --expiration 1h
   sudo tailscale up --login-server https://$VPN_SUBDOMAIN.$DOMAIN --authkey <key>
 
 EOF
