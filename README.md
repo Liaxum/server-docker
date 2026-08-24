@@ -149,7 +149,7 @@ beforehand overrides the stored value.
 | | |
 |---|---|
 | `DOMAIN` | serves `vpn.`, `files.`, `monitor.`, `mcp.` |
-| `MANAGER_HOSTNAME` | the `node.hostname ==` placement constraint |
+| `MANAGER_HOSTNAME` | the `node.hostname ==` constraint; the host stage offers to rename the target to match |
 | `MESH_ADDR` | this node's mesh address; the NFS server binds it |
 | `MESH_CIDR` | range headscale hands out **and** the NFS export admits |
 | `*_STACK` | stack names: `TRAEFIK_`, `VPN_`, `FILES_`, `MONITOR_` |

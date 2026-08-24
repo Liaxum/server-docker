@@ -239,6 +239,8 @@ stage_config() {
 
   ask DOMAIN           "Domain serving the stacks"       "liaxum.fr"
   ask MANAGER_HOSTNAME "Hostname of the manager node"    "$(host_eval 'hostname -s' 2>/dev/null || hostname)"
+  [[ "$MANAGER_HOSTNAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+    || die "MANAGER_HOSTNAME '$MANAGER_HOSTNAME' is not a valid hostname"
   ask MESH_ADDR        "This node's address on the mesh" "100.64.0.1"
   # Headscale hands out addresses from this range and the NFS export admits
   # that same range, so the two have to be set together.
@@ -319,6 +321,31 @@ may_fix() {
   (( WITH_HOST_SETUP )) || confirm "$1"
 }
 
+# The swarm records a node's hostname when it joins, and the placement
+# constraints match on it -- so this has to be settled before ensure_swarm.
+ensure_hostname() {
+  local current
+  current="$(host_eval 'hostname -s' 2>/dev/null)" || current=""
+  [[ -n "$current" ]] || { warn "could not read the target's hostname"; return; }
+  [[ "$current" == "$MANAGER_HOSTNAME" ]] && { skip "hostname is already $MANAGER_HOSTNAME"; return; }
+
+  if swarm_active; then
+    warn "target is called $current, but MANAGER_HOSTNAME is $MANAGER_HOSTNAME. It already belongs to a swarm, which recorded $current at join time -- renaming now would not change 'docker node ls', and the placement constraints would match no node. Set MANAGER_HOSTNAME to $current instead."
+    return
+  fi
+
+  may_fix "Target is called $current but MANAGER_HOSTNAME is $MANAGER_HOSTNAME. Rename the host?" \
+    || { blocker "target is called $current but MANAGER_HOSTNAME is $MANAGER_HOSTNAME; placement constraints would match no node."; return; }
+
+  if host_eval 'command -v hostnamectl >/dev/null 2>&1'; then
+    host_run "sudo hostnamectl set-hostname $MANAGER_HOSTNAME"
+  else
+    host_run "printf '%s\\n' $MANAGER_HOSTNAME | sudo tee /etc/hostname >/dev/null && sudo hostname $MANAGER_HOSTNAME"
+  fi
+  # Without this, every later sudo prints "unable to resolve host".
+  host_run "grep -qw $MANAGER_HOSTNAME /etc/hosts || printf '127.0.1.1 %s\\n' $MANAGER_HOSTNAME | sudo tee -a /etc/hosts >/dev/null"
+}
+
 ensure_nfs_client() {
   local where="${SSH_TARGET:-this machine}"
   host_eval 'command -v mount.nfs4 >/dev/null 2>&1' && { skip "NFS client utilities present"; return; }
@@ -381,6 +408,7 @@ stage_host() {
     die "docker is pointed at a remote daemon ($(docker info --format '{{.Name}}')), so host checks would run against the wrong machine. Use --ssh <user@host> to target it, or run this on the manager itself."
   fi
 
+  ensure_hostname
   ensure_nfs_client
   ensure_swarm
   ensure_vpn_dir
