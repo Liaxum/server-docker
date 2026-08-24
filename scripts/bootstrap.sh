@@ -740,27 +740,34 @@ join_mesh() {
   created="$(host_eval "docker exec $container headscale users create $MESH_USER 2>&1")" || true
 
   local ref
-  ref="$(headscale_user_id "$container" "$MESH_USER")"
-  if [[ -z "$ref" ]]; then
-    # Falling back to the name only works on headscale < 0.24, so say what was
-    # seen rather than letting the next command fail with a parse error.
+  local -a refs
+  ref="$(headscale_user_id "$container" "$MESH_USER")" || true
+  if [[ -n "$ref" ]]; then
+    refs=("$ref")
+  else
     warn "could not find a user id for '$MESH_USER'. headscale users create said:"
     printf '%s\n' "${created:-(no output)}" | tail -3 | sed 's/^/      /' >&2
     warn "and users list said:"
     host_eval "docker exec $container headscale users list 2>&1" | tail -5 | sed 's/^/      /' >&2
-    ref="$MESH_USER"
+    # 0.24 and later want a numeric id, and a fresh install numbers the first
+    # user 1; older builds want the name. Try both rather than pick a version.
+    warn "trying user id 1, then the name '$MESH_USER'"
+    refs=(1 "$MESH_USER")
   fi
 
   # Keep stderr: when this fails it is the only thing that explains why, and
   # headscale's CLI has changed shape across releases.
-  out="$(host_eval "docker exec $container headscale preauthkeys create --user $ref --reusable --expiration 1h --output json 2>&1")" || true
-  key="$(printf '%s' "$out" | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)" || true
-  if [[ -z "$key" ]]; then
-    out="$(host_eval "docker exec $container headscale preauthkeys create --user $ref --reusable --expiration 1h 2>&1")" || true
-    key="$(printf '%s' "$out" | tail -1 | tr -d '[:space:]')" || true
-    # A usable key is a long opaque token; anything else is an error message.
-    [[ "$key" =~ ^[A-Za-z0-9]{20,}$ ]] || key=""
-  fi
+  for ref in "${refs[@]}"; do
+    out="$(host_eval "docker exec $container headscale preauthkeys create --user $ref --reusable --expiration 1h --output json 2>&1")" || true
+    key="$(printf '%s' "$out" | grep -o '"key":"[^"]*"' | head -1 | cut -d'"' -f4)" || true
+    if [[ -z "$key" ]]; then
+      out="$(host_eval "docker exec $container headscale preauthkeys create --user $ref --reusable --expiration 1h 2>&1")" || true
+      key="$(printf '%s' "$out" | tail -1 | tr -d '[:space:]')" || true
+      # A usable key is a long opaque token; anything else is an error message.
+      [[ "$key" =~ ^[A-Za-z0-9]{20,}$ ]] || key=""
+    fi
+    [[ -n "$key" ]] && break
+  done
 
   # A key is the tidy path, not the only one: without one the node asks
   # headscale to register it, and that request can be approved below.
