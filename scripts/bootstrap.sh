@@ -42,9 +42,10 @@ DRY_RUN=0
 FROM_STAGE=""
 ONLY_STAGE=""
 
-# Certificate material for Traefik. Not in the repo -- .gitignore excludes it.
-CRT_FILE="${CRT_FILE:-traefik/secret/liaxum.crt}"
-KEY_FILE="${KEY_FILE:-traefik/secret/liaxum.key}"
+# Where to look for Traefik's certificate material. Not in the repo --
+# .gitignore excludes it. Extensions vary by CA (.crt, .cer, .pem), so the
+# files are identified by content rather than by name.
+CERT_DIR="${CERT_DIR:-traefik/secret}"
 
 # Docker needs this when the host has several addresses and cannot choose.
 SWARM_ADVERTISE_ADDR="${SWARM_ADVERTISE_ADDR:-}"
@@ -225,7 +226,7 @@ require_settings() {
   local v
   for v in DOMAIN MANAGER_HOSTNAME MESH_ADDR MESH_CIDR \
            TRAEFIK_STACK VPN_STACK VPN_SUBDOMAIN FILES_STACK FILES_SUBDOMAIN \
-           MONITOR_STACK MONITOR_SUBDOMAIN MCP_SUBDOMAIN; do
+           MONITOR_STACK MONITOR_SUBDOMAIN MCP_SUBDOMAIN CRT_FILE KEY_FILE; do
     [[ -n "${!v:-}" ]] || die "$v is not set. Run '$0 --only config' first, or export it."
     export "$v=${!v}"
   done
@@ -264,6 +265,9 @@ stage_config() {
   ask MONITOR_SUBDOMAIN  "Subdomain for komodo"        "monitor"
   ask MCP_SUBDOMAIN      "Subdomain for the komodo MCP server" "mcp"
 
+  ask CRT_FILE "TLS certificate file" "$(detect_pem cert || echo "$CERT_DIR/liaxum.pem")"
+  ask KEY_FILE "TLS private key file" "$(detect_pem key  || echo "$CERT_DIR/liaxum.key")"
+
   ask HEADPLANE_API_KEY       "Headplane API key (blank to fill in later)" "" "" optional
   ask HEADPLANE_COOKIE_SECRET "Headplane cookie secret" "$(openssl rand -hex 16 2>/dev/null || head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
@@ -285,6 +289,8 @@ FILES_SUBDOMAIN=$FILES_SUBDOMAIN
 MONITOR_STACK=$MONITOR_STACK
 MONITOR_SUBDOMAIN=$MONITOR_SUBDOMAIN
 MCP_SUBDOMAIN=$MCP_SUBDOMAIN
+CRT_FILE=$CRT_FILE
+KEY_FILE=$KEY_FILE
 HEADPLANE_API_KEY=$HEADPLANE_API_KEY
 HEADPLANE_COOKIE_SECRET=$HEADPLANE_COOKIE_SECRET
 EOF
@@ -293,6 +299,60 @@ EOF
 
   printf '    %s, manager %s, mesh %s in %s\n' "*.$DOMAIN" "$MANAGER_HOSTNAME" "$MESH_ADDR" "$MESH_CIDR"
   printf '    stacks: %s %s %s %s\n' "$TRAEFIK_STACK" "$VPN_STACK" "$FILES_STACK" "$MONITOR_STACK"
+}
+
+# First file in CERT_DIR that parses as a certificate ("cert") or a private
+# key ("key"). Naming is inconsistent across CAs and a .pem may be either, so
+# ask openssl rather than trusting the extension.
+detect_pem() {
+  local kind="$1" f
+  local -a candidates
+  have openssl || return 1
+  # Preference matters when several files parse: this repo's convention is to
+  # convert the CA's .cer/.key into .pem before use, so .pem wins.
+  case "$kind" in
+    cert) candidates=("$CERT_DIR"/*.pem "$CERT_DIR"/*.crt "$CERT_DIR"/*.cer "$CERT_DIR"/*) ;;
+    key)  candidates=("$CERT_DIR"/*.key "$CERT_DIR"/*.pem "$CERT_DIR"/*) ;;
+  esac
+  for f in "${candidates[@]}"; do
+    [[ -f "$f" ]] || continue
+    case "$kind" in
+      cert) openssl x509 -in "$f" -noout >/dev/null 2>&1 && { printf '%s' "$f"; return 0; } ;;
+      key)  openssl pkey -in "$f" -noout >/dev/null 2>&1 && { printf '%s' "$f"; return 0; } ;;
+    esac
+  done
+  return 1
+}
+
+# A mismatched pair deploys happily and then fails TLS at runtime, so compare
+# the public key the certificate carries against the one the key derives.
+check_cert_pair() {
+  have openssl || { skip "openssl absent; not checking the certificate"; return 0; }
+
+  # Traefik reads the secret verbatim and needs PEM. openssl 3 auto-detects
+  # DER, so parsing successfully is not evidence of the right encoding --
+  # check the armour.
+  local head
+  head="$(head -c 11 "$CRT_FILE" 2>/dev/null)"
+  [[ "$head" == "-----BEGIN " ]] \
+    || die "$CRT_FILE is not PEM (Traefik needs PEM). If your CA gave you DER: openssl x509 -inform DER -in $CRT_FILE -out ${CRT_FILE%.*}.pem"
+  head="$(head -c 11 "$KEY_FILE" 2>/dev/null)"
+  [[ "$head" == "-----BEGIN " ]] \
+    || die "$KEY_FILE is not PEM (Traefik needs PEM). If your CA gave you DER: openssl pkey -inform DER -in $KEY_FILE -out ${KEY_FILE%.*}.pem"
+
+  openssl x509 -in "$CRT_FILE" -noout >/dev/null 2>&1 \
+    || die "$CRT_FILE does not parse as a certificate"
+  openssl pkey -in "$KEY_FILE" -noout >/dev/null 2>&1 \
+    || die "$KEY_FILE does not parse as a private key"
+
+  local a b
+  a="$(openssl x509 -in "$CRT_FILE" -noout -pubkey 2>/dev/null)"
+  b="$(openssl pkey -in "$KEY_FILE" -pubout 2>/dev/null)"
+  [[ "$a" == "$b" ]] || die "$CRT_FILE and $KEY_FILE are not a pair: the certificate's public key does not match the private key"
+
+  local expiry
+  expiry="$(openssl x509 -in "$CRT_FILE" -noout -enddate 2>/dev/null)" || true
+  ok "certificate ok (${expiry#notAfter=})"
 }
 
 # A precondition this run cannot meet. Fatal normally; under --dry-run it is
@@ -434,6 +494,10 @@ stage_swarm() {
     skip "network web-net exists"
   else
     run docker network create --driver overlay --attachable web-net
+  fi
+
+  if ! secret_exists liaxum_crt || ! secret_exists liaxum_key; then
+    [[ -f "$CRT_FILE" && -f "$KEY_FILE" ]] && check_cert_pair
   fi
 
   # Docker secrets are immutable: to rotate a certificate you remove the

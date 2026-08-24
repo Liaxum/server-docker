@@ -154,6 +154,7 @@ beforehand overrides the stored value.
 | `MESH_CIDR` | range headscale hands out **and** the NFS export admits |
 | `*_STACK` | stack names: `TRAEFIK_`, `VPN_`, `FILES_`, `MONITOR_` |
 | `*_SUBDOMAIN` | subdomains: `VPN_`, `FILES_`, `MONITOR_`, `MCP_` |
+| `CRT_FILE` / `KEY_FILE` | TLS material; detected in `traefik/secret/` by content |
 | `HEADPLANE_API_KEY` | minted in headplane, so blank on a first run |
 | `HEADPLANE_COOKIE_SECRET` | generated if you accept the default |
 
@@ -175,6 +176,14 @@ the committed defaults. Headscale's `config.yaml` and `headplane_config.yaml`
 are mounted as Docker configs, and Compose never interpolates *file contents* —
 so those are tracked as `.template` files and rendered by the `vpn` stage. The
 rendered files are gitignored; edit the template, not the output.
+
+The certificate and key are found by asking openssl what each file in
+`traefik/secret/` actually is, rather than by extension — CAs hand out `.crt`,
+`.cer` and `.pem` for the same thing, and a `.pem` may be either half. `.pem`
+wins when several parse, matching this repo's convert-before-use convention.
+Before the secrets are created the pair is checked: both PEM, both parseable,
+and the certificate's public key equal to the one the private key derives. A
+mismatched pair otherwise deploys cleanly and fails TLS at runtime.
 
 Two things it will not do. Certificates: `liaxum_crt` and `liaxum_key` are
 created from `traefik/secret/` (override with `CRT_FILE`/`KEY_FILE`), and
