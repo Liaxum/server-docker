@@ -349,16 +349,27 @@ stage_swarm() {
   ok "swarm resources ready"
 }
 
-stage_traefik()     { info "traefik";     run docker stack deploy -c traefik/compose.yml "$TRAEFIK_STACK"; }
-stage_filebrowser() { info "filebrowser"; run docker stack deploy -c apps/filebrowser/compose.yml "$FILES_STACK"; }
-stage_monitor()     { info "komodo";      run docker stack deploy -c apps/monitor/compose.yml "$MONITOR_STACK"; }
+# Deploy a stack, unless its compose file is absent -- a startup-mode sparse
+# checkout carries only the stacks needed to boot the cluster.
+deploy() {
+  local file="$1" stack="$2"
+  if [[ ! -f "$file" ]]; then
+    skip "$file not in this checkout; skipping"
+    return
+  fi
+  run docker stack deploy -c "$file" "$stack"
+}
+
+stage_traefik()     { info "traefik";     deploy traefik/compose.yml "$TRAEFIK_STACK"; }
+stage_filebrowser() { info "filebrowser"; deploy apps/filebrowser/compose.yml "$FILES_STACK"; }
+stage_monitor()     { info "komodo";      deploy apps/monitor/compose.yml "$MONITOR_STACK"; }
 
 stage_vpn() {
   info "headscale"
   # compose reads these as files, so they are rendered rather than interpolated
-  render apps/vpn/config.yaml.template
-  render apps/vpn/headplane_config.yaml.template
-  run docker stack deploy -c apps/vpn/compose.yml "$VPN_STACK"
+  [[ -f apps/vpn/config.yaml.template ]] && render apps/vpn/config.yaml.template
+  [[ -f apps/vpn/headplane_config.yaml.template ]] && render apps/vpn/headplane_config.yaml.template
+  deploy apps/vpn/compose.yml "$VPN_STACK"
 }
 
 stage_mesh() {
@@ -396,6 +407,7 @@ EOF
 
 stage_nfs() {
   info "nfs server"
+  [[ -f apps/nfs/compose.yml ]] || { skip "apps/nfs/compose.yml not in this checkout; skipping"; return; }
   # Standalone compose, not a stack: the kernel NFS server needs privileges
   # and an AppArmor bypass that swarm services cannot be granted.
   # --remove-orphans clears containers left by earlier service names.

@@ -64,6 +64,38 @@ prerequisites and stops with the exact command to run if one is missing. With
 it, it installs the NFS client utilities, initialises the swarm, creates
 `/opt/vpn/data` and adds the ufw rule.
 
+### Startup mode
+
+Only five paths are needed to boot the cluster: `scripts`, `traefik`,
+`apps/vpn`, `apps/nfs`, `apps/monitor`. Everything else is deployed by Komodo
+once it is running, so a machine whose only job is bringing the cluster up
+does not need it.
+
+On a fresh machine, clone narrow to begin with:
+
+```bash
+git clone --filter=blob:none --sparse <url> server-docker
+cd server-docker
+git sparse-checkout set scripts traefik apps/vpn apps/nfs apps/monitor
+```
+
+On a clone you already have:
+
+```bash
+./scripts/startup-mode.sh          # narrow to the startup paths
+./scripts/startup-mode.sh --full   # widen back
+./scripts/startup-mode.sh --list   # print the paths
+```
+
+This is `git sparse-checkout`, so nothing leaves history and widening needs no
+network. Cone mode always keeps root files, so `README.md` and `.gitignore`
+come along — which is why the fresh-clone commands above are reachable from a
+narrow clone. `scripts/startup-mode.sh` is not: a `--sparse` clone starts with
+root files only, so the first narrowing has to be the plain git command.
+
+`bootstrap.sh` skips any stage whose compose file is absent rather than
+failing, so the same script works in both modes.
+
 ### Driving it from another machine
 
 `docker stack deploy -c file` reads the compose file **client-side** and sends
