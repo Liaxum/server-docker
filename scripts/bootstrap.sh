@@ -45,6 +45,7 @@ STATE_FILE="${STATE_FILE:-/var/lib/server-docker-bootstrap.state}"
 WITH_HOST_SETUP=0
 RECONFIGURE=0
 SSH_TARGET=""
+JOINED_ADDR=""
 RESET_CONFIG=0
 UNINSTALL=0
 WITH_DATA=0
@@ -728,11 +729,32 @@ join_mesh() {
     return 1
   fi
 
-  # Without a timeout this retries an unreachable control server forever,
-  # which looks like the command doing nothing at all.
-  host_run "sudo tailscale up --timeout 45s --login-server https://$VPN_SUBDOMAIN.$DOMAIN --authkey $key >/dev/null" \
-    || { warn "tailscale up did not complete. Check that https://$VPN_SUBDOMAIN.$DOMAIN resolves to this host and serves a valid certificate: curl -sS -o /dev/null -w '%{http_code}\\n' https://$VPN_SUBDOMAIN.$DOMAIN/health"; return 1; }
-  return 0
+  # --timeout stops an unreachable control server being retried forever, which
+  # otherwise looks like the command doing nothing. But it waits for the
+  # backend to reach Running -- DERP setup and all -- not just for the
+  # handshake, and a first join routinely takes longer than that. So give it
+  # room, and treat a timeout as "not yet" rather than "failed": the backend
+  # carries on after up returns.
+  host_run "sudo tailscale up --timeout 120s --login-server https://$VPN_SUBDOMAIN.$DOMAIN --authkey $key >/dev/null" || true
+
+  local i got
+  printf '    waiting for an address' >&2
+  for i in $(seq 1 20); do
+    got="$(host_eval 'tailscale ip -4 2>/dev/null | head -1' | tr -d '[:space:]')" || got=""
+    if [[ -n "$got" ]]; then
+      printf '\n' >&2
+      JOINED_ADDR="$got"     # what tailscale actually got, not what we hoped
+      return 0
+    fi
+    printf '.' >&2
+    sleep 3
+  done
+  printf '\n' >&2
+
+  warn "tailscale did not get an address. Its own view of why:"
+  host_eval 'tailscale status 2>&1 | head -5' | sed 's/^/      /' >&2
+  warn "if that mentions certificate or connection trouble, check https://$VPN_SUBDOMAIN.$DOMAIN/health from this host and that the certificate includes its intermediate chain"
+  return 1
 }
 
 # Show what to run, then wait rather than exiting: the operator finishes the
@@ -746,7 +768,7 @@ Run this on ${SSH_TARGET:-this host}, then come back:
   C=\$(docker ps -qf name=${VPN_STACK}_core)
   docker exec \$C headscale users list          # note the id of $MESH_USER
   docker exec \$C headscale preauthkeys create --user <id> --reusable --expiration 1h
-  sudo tailscale up --timeout 45s --login-server https://$VPN_SUBDOMAIN.$DOMAIN --authkey <key>
+  sudo tailscale up --timeout 120s --login-server https://$VPN_SUBDOMAIN.$DOMAIN --authkey <key>
 
 EOF
   [[ -t 0 ]] || return 1
@@ -757,14 +779,6 @@ EOF
     mesh_addr_held && return 0
     warn "${SSH_TARGET:-this host} still does not hold $MESH_ADDR"
   done
-}
-
-# headscale allocates in order, so the address is not ours to choose.
-check_mesh_addr() {
-  local got
-  got="$(host_eval 'tailscale ip -4 2>/dev/null | head -1' | tr -d '[:space:]')" || got=""
-  [[ -z "$got" || "$got" == "$MESH_ADDR" ]] && return 0
-  die "joined the mesh, but headscale assigned $got rather than $MESH_ADDR. Set MESH_ADDR to $got (re-run with --reconfigure): the NFS server binds it, and the clients mount it."
 }
 
 stage_mesh() {
@@ -785,11 +799,16 @@ stage_mesh() {
     return
   fi
 
-  if join_mesh && mesh_addr_held; then
-    ok "joined the mesh as $MESH_ADDR"
-    return
+  # Trust what tailscale reports rather than re-deriving it: the interface can
+  # take a moment to appear in ip addr after the address is assigned.
+  if join_mesh; then
+    if [[ "$JOINED_ADDR" == "$MESH_ADDR" ]]; then
+      ok "joined the mesh as $MESH_ADDR"
+      return
+    fi
+    # headscale allocates in order, so the address is not ours to choose.
+    die "joined the mesh, but headscale assigned $JOINED_ADDR rather than $MESH_ADDR. Set MESH_ADDR to $JOINED_ADDR (re-run with --reconfigure): the NFS server binds it, and the clients mount it."
   fi
-  check_mesh_addr
 
   if wait_for_mesh; then
     ok "$MESH_ADDR is assigned to ${SSH_TARGET:-this host}"
