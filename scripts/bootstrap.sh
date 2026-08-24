@@ -643,7 +643,12 @@ ensure_headplane_key() {
 
   HEADPLANE_API_KEY="$key"
   write_env
-  ok "minted a headplane API key (90d) and saved it to $ENV_FILE"
+  ok "minted a headplane API key (90d), valid 90 days"
+  # Headplane's sign-in asks for this, so it has to be readable, not just
+  # stored. It is in $ENV_FILE too, mode 600.
+  printf '\n    %sheadplane API key -- paste this to sign in at https://%s.%s/admin%s\n' \
+    "$BOLD" "$VPN_SUBDOMAIN" "$DOMAIN" "$OFF"
+  printf '    %s\n\n' "$HEADPLANE_API_KEY"
   return 0
 }
 
@@ -909,7 +914,9 @@ stage_verify() {
 
 $(printf '%s' "$GREEN")All services are up.$(printf '%s' "$OFF")
 
-  headscale   https://$VPN_SUBDOMAIN.$DOMAIN     admin at /admin
+  headscale   https://$VPN_SUBDOMAIN.$DOMAIN
+  headplane   https://$VPN_SUBDOMAIN.$DOMAIN/admin
+              sign in with: ${HEADPLANE_API_KEY:-<none; re-run the vpn stage>}
   filebrowser https://$FILES_SUBDOMAIN.$DOMAIN     password: docker service logs ${FILES_STACK}_core
   komodo      https://$MONITOR_SUBDOMAIN.$DOMAIN
 
