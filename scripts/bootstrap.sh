@@ -743,6 +743,24 @@ join_mesh() {
 
   may_fix "Enrol $where in headscale as user '$MESH_USER'?" || return 1
 
+  # tailscaled verifies the control server against the system trust store, the
+  # same one curl uses. If curl cannot verify it, neither can tailscale, and
+  # the join will sit until it times out with nothing useful to say. Ask first.
+  if ! host_eval "curl -sS -o /dev/null --max-time 10 https://$VPN_SUBDOMAIN.$DOMAIN/health >/dev/null 2>&1"; then
+    local why
+    why="$(host_eval "curl -sS -o /dev/null --max-time 10 https://$VPN_SUBDOMAIN.$DOMAIN/health 2>&1 | head -3")" || true
+    warn "$where cannot reach https://$VPN_SUBDOMAIN.$DOMAIN/health, and tailscale uses the same trust store:"
+    printf '%s\n' "${why:-(no output)}" | sed 's/^/      /' >&2
+    if printf '%s' "$why" | grep -qi 'certificate\|SSL'; then
+      warn "that is a certificate problem. A leaf without its intermediates fails here even though browsers accept it -- concatenate the CA's chain and replace the secret:"
+      printf '      cat leaf.cer intermediate.cer > fullchain.pem\n' >&2
+      printf '      docker stack rm %s && sleep 5 && docker secret rm liaxum_crt\n' "$TRAEFIK_STACK" >&2
+      printf '      docker secret create liaxum_crt fullchain.pem\n' >&2
+      printf '      %s --only traefik    # then re-run --from mesh\n' "$0" >&2
+    fi
+    return 1
+  fi
+
   # Already-exists is the normal case on a re-run, so its failure is not fatal.
   local created
   created="$(host_eval "docker exec $container headscale users create $MESH_USER 2>&1")" || true
