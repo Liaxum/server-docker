@@ -693,7 +693,19 @@ headscale_user_id() {
   out="$(host_eval "docker exec $container headscale users list 2>/dev/null")" || out=""
   id="$(printf '%s' "$out" | awk -v n="$name" -F'[|[:space:]]+' \
         '{ for (i = 1; i <= NF; i++) if ($i == n && $1 ~ /^[0-9]+$/) { print $1; exit } }' | head -1)"
-  [[ -n "$id" ]] && printf '%s' "$id"
+  [[ -n "$id" ]] && { printf '%s' "$id"; return 0; }
+
+  # Neither shape matched, which means an output we do not parse. A fresh
+  # install has exactly one user, so an unambiguous single id is safe to take
+  # -- and stays right if that user is not number one. Two or more, and we
+  # would be guessing, so we do not.
+  local ids count
+  ids="$(printf '%s' "$out" | grep -oE '^[[:space:]]*[0-9]+[[:space:]]*\|' | tr -cd '0-9\n')"
+  count="$(printf '%s\n' "$ids" | grep -c '[0-9]' || true)"
+  if [[ "$count" == "1" ]]; then
+    printf '%s' "$(printf '%s' "$ids" | tr -d '[:space:]')"
+    return 0
+  fi
   return 0
 }
 
