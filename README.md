@@ -152,7 +152,9 @@ touches nothing else, so the next run asks afresh and redeploys over whatever
 is running.
 
 `--uninstall` removes the four stacks, the standalone NFS compose project,
-`web-net`, the TLS secrets and the config objects. It prints what it found
+`web-net`, the TLS secrets, the config objects, and finally `bootstrap.env`
+and the rendered vpn configs — last, because everything before it needs those
+settings to know what to remove. It prints what it found
 before doing anything and asks you to type the manager hostname; without a
 terminal to ask on, it refuses. Volumes are kept unless `--with-data` is
 given, which destroys the Komodo database, the keys and the shared files.

@@ -845,6 +845,7 @@ do_uninstall() {
   printf '    network: web-net\n'
   printf '    secrets: liaxum_crt liaxum_key\n'
   printf '    configs: traefik_dynamic, and the vpn config objects\n'
+  printf '    local:   %s and the rendered vpn configs\n' "$ENV_FILE"
   if (( WITH_DATA )); then
     printf '    %svolumes: %s%s\n' "$RED" "${volumes[*]}" "$OFF"
     printf '    %sthis destroys the komodo database, the keys and the shared files%s\n' "$RED" "$OFF"
@@ -893,6 +894,9 @@ do_uninstall() {
     done
     warn "volumes on other nodes are not reachable from here; remove ${MONITOR_STACK}_keys on each worker"
   fi
+
+  # Last, because everything above needs the settings to know what to remove.
+  do_reset_config
 
   ok "uninstalled"
   return 0
