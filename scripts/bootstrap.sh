@@ -602,18 +602,38 @@ stage_monitor()     { info "komodo";      deploy apps/monitor/compose.yml "$MONI
 
 # Headplane authenticates to headscale with an API key. Leaving it blank
 # renders a config whose UI cannot read anything, so mint one and keep it.
+# A headscale API key is <prefix>.<secret>, and apikeys list shows prefixes.
+# That is enough to tell a live key from one left over after the database was
+# replaced -- which otherwise sits in bootstrap.env looking perfectly valid.
+headplane_key_live() {
+  local container="$1" key="$2" prefix
+  prefix="${key%%.*}"
+  [[ -n "$prefix" && "$prefix" != "$key" ]] || return 1
+  host_eval "docker exec $container headscale apikeys list 2>/dev/null" | grep -qF "$prefix"
+}
+
 ensure_headplane_key() {
   local container out key
-  [[ -n "${HEADPLANE_API_KEY:-}" ]] && return 1
-  (( DRY_RUN )) && { skip "would mint a headplane API key"; return 1; }
+  (( DRY_RUN )) && { skip "would check headplane's API key, and mint one if needed"; return 1; }
 
   container="$(host_eval "docker ps -qf name=${VPN_STACK}_core | head -1")" || container=""
   [[ -n "$container" ]] || return 1
 
-  may_fix "Headplane has no API key, so its admin UI cannot read headscale. Mint one?" || return 1
+  if [[ -n "${HEADPLANE_API_KEY:-}" ]]; then
+    if headplane_key_live "$container" "$HEADPLANE_API_KEY"; then
+      skip "headplane's API key is still valid"
+      return 1
+    fi
+    warn "the stored headplane API key is not known to this headscale (its database was probably replaced); minting a new one"
+  fi
+
+  may_fix "Headplane needs an API key to read headscale. Mint one?" || return 1
 
   out="$(host_eval "docker exec $container headscale apikeys create --expiration 90d 2>&1")" || true
-  key="$(printf '%s' "$out" | tr -d '\r' | grep -Eo '[A-Za-z0-9_.-]{30,}' | tail -1)"
+  # The key is printed alone on a line; take the longest token that carries the
+  # prefix.secret shape rather than anything long-ish in a log line.
+  key="$(printf '%s' "$out" | tr -d '\r' | grep -Eo '[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{20,}' | tail -1)"
+  [[ -n "$key" ]] || key="$(printf '%s' "$out" | tr -d '\r' | grep -Eo '^[A-Za-z0-9_.-]{30,}$' | tail -1)"
   if [[ -z "$key" ]]; then
     warn "could not mint a headplane API key. headscale said:"
     printf '%s\n' "$out" | tail -5 | sed 's/^/      /' >&2
