@@ -142,6 +142,62 @@ The connection is checked once up front, so an unreachable host fails as a
 connection error instead of surfacing as a missing package or an absent
 directory in every later check. `sudo` gets a terminal, so it can prompt.
 
+### Moving the swarm onto the mesh
+
+Docker fixes a manager's advertise address at `docker swarm init` and there is
+no way to change it afterwards. The bootstrap order makes that awkward: the
+swarm has to exist before Traefik, which has to exist before headscale, which
+is what hands out the mesh address — so on a first run the node does not hold
+`MESH_ADDR` yet and Docker advertises whatever interface it picks, usually the
+public one.
+
+The consequence is not cosmetic. `docker swarm join-token worker` then prints
+a public address, workers join over it, and the overlay carries their traffic
+over the internet rather than the mesh.
+
+`SWARM_ADVERTISE_ADDR` is asked for in the config stage and defaults to
+`MESH_ADDR`. The `host` stage uses it when the node holds that address, and
+when the node is already in a swarm advertising something else, it offers to
+move it:
+
+```
+The swarm advertises 203.0.113.10. Workers join over that address and the
+overlay carries their traffic there, so it will not use the mesh.
+...
+    Re-initialise the swarm to advertise 100.64.0.1? [y/N]:
+```
+
+Saying yes runs `docker swarm leave --force` and re-initialises on the address
+you chose; the stages after it rebuild the services, secrets and config
+objects. Volumes are untouched, so the Komodo database, the keys and the
+shared files survive. Any worker already joined has to re-join with the new
+token. This one prompt defaults to **no**, unlike the other host prompts,
+because it throws away the running cluster to rebuild it.
+
+A first run cannot advertise the mesh address at all: the swarm has to exist
+before Traefik, which comes before headscale, which is what hands the address
+out. So the `host` stage lets Docker choose, and says so.
+
+The `mesh` stage then closes the loop. The moment after the node joins is the
+first time it holds the address, so the stage moves the swarm onto it and
+rebuilds what that destroys — swarm resources, Traefik and headscale, in that
+order. A plain run therefore ends with the swarm on the mesh without anyone
+having to notice:
+
+```
+  ok joined the mesh as 100.64.0.1
+==> moving the swarm onto 100.64.0.1
+    Re-initialise the swarm to advertise 100.64.0.1? [Y/n]:
+  ok swarm re-initialised, advertising 100.64.0.1
+==> swarm resources
+==> traefik
+==> headscale
+```
+
+Volumes and `/opt/vpn/data` are untouched, so headscale keeps its database and
+this node stays registered. Any worker already joined has to re-join with the
+new token.
+
 ### Starting over, and removing it
 
 ```bash
