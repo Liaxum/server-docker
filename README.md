@@ -246,8 +246,8 @@ recorded, so none of it is touched. The record is printed before the reversal
 runs, so you can see exactly what is about to be undone. `/opt/vpn/data` is
 kept unless `--with-data` is given, since it holds headscale's database.
 
-Volumes on worker nodes remain out of reach — remove `<monitor stack>_keys`
-on each.
+Volumes on worker nodes remain out of reach from the manager — run
+`join-worker.sh --leave` against each worker, which removes them there.
 
 ### Settings
 
@@ -340,7 +340,9 @@ is the slow part, and a service still starting is not a broken one.
 ./scripts/join-worker.sh --ssh user@gamingpc               # repo here, worker there
 ./scripts/join-worker.sh --ssh user@gamingpc --manager root@vps   # nothing to copy by hand
 ./scripts/join-worker.sh --only verify                     # just check
-./scripts/join-worker.sh --leave                           # undo
+./scripts/join-worker.sh --leave                           # leave, stay ready
+./scripts/join-worker.sh --uninstall                       # and the images
+./scripts/join-worker.sh --uninstall --with-host           # and the host changes
 ```
 
 The stages are `config host mesh swarm verify`, and the order is the point.
@@ -438,7 +440,7 @@ refused it points at the `fsid=0` root rather than leaving you to guess.
 
 The last two lines need `--manager`; without it they are skipped with a note.
 
-### Settings, and removing a worker
+### Settings
 
 Cluster-wide answers come from `bootstrap.env` when the checkout has one, so
 the repo that built the manager joins workers without asking twice. This
@@ -446,11 +448,48 @@ script never writes that file. Its own answers go to `worker.env`, or
 `worker-<target>.env` when `--ssh` is given, so several workers can be driven
 from one checkout.
 
-`--leave` undoes the join in reverse: swarm first, because leaving the mesh
-first strands the node with no route to the manager. It removes the stale
-`Down` node from `docker node ls` when `--manager` is given, and reverses only
-the host changes it recorded in `/var/lib/server-docker-worker.state`. The node
-stays registered in headscale — delete it in Headplane → Machines.
+### Removing a worker
+
+```bash
+./scripts/join-worker.sh --ssh user@gamingpc --leave              # leave, stay ready
+./scripts/join-worker.sh --ssh user@gamingpc --uninstall          # and the images
+./scripts/join-worker.sh --ssh user@gamingpc --uninstall --with-host
+```
+
+Both print what they found and ask you to type the node's hostname before
+touching anything; without a terminal to ask on, they refuse.
+
+The order is the reverse of the join, and for the same reason: the swarm goes
+first so nothing is scheduled onto a node whose volumes are about to vanish,
+the manager's `docker node rm` happens while the mesh is still up in case ssh
+to it runs over the mesh, and Tailscale comes down last.
+
+**The cached NFS volumes are removed either way**, and this is the part worth
+knowing about. Swarm caches a broken NFS volume on every node it ever tried to
+schedule onto, so a stale one survives a redeploy and keeps failing — see
+[Swarm caches broken volumes](#swarm-caches-broken-volumes). They are local
+handles, not data: the files stay on the manager. They are found by driver
+option rather than by name, so a worker's own unrelated local volumes are
+never touched:
+
+```
+    volumes: monitor_keys
+```
+
+`--uninstall` also removes the cluster's images, but only the ones this node
+actually pulled — a worker never runs Traefik, so listing it would be noise.
+`--keep-images` skips that.
+
+`--with-host` reverses **only** what the host stage recorded doing in
+`/var/lib/server-docker-worker.state`: packages it installed, the
+`nfs-client.conf` module config it wrote, Tailscale and Docker if it installed
+them, and the hostname if it changed it. A package that was already there, a
+hostname nobody changed — none of it is recorded, so none of it is touched.
+Docker is removed last, since undoing it earlier would take the daemon out from
+under every step above.
+
+The node stays registered in headscale either way — delete it in Headplane →
+Machines, or `headscale nodes delete -i <id>` on the manager.
 
 ## Bring-up order
 

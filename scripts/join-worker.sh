@@ -14,7 +14,10 @@
 #   ./scripts/join-worker.sh --from swarm           # resume from a stage
 #   ./scripts/join-worker.sh --only verify          # run a single stage
 #   ./scripts/join-worker.sh --dry-run              # print what would run
-#   ./scripts/join-worker.sh --leave                # undo: swarm, then mesh
+#   ./scripts/join-worker.sh --leave                # leave the cluster, stay ready
+#   ./scripts/join-worker.sh --uninstall            # and the images
+#   ./scripts/join-worker.sh --uninstall --with-host    # and the host changes
+#   ./scripts/join-worker.sh --uninstall --keep-images  # leave the images alone
 #
 # Cluster-wide settings -- domain, the manager's mesh address, the headscale
 # user -- are read from bootstrap.env when it is there, so the same repo that
@@ -49,6 +52,9 @@ WITH_HOST_SETUP=0
 RECONFIGURE=0
 DRY_RUN=0
 LEAVE=0
+UNINSTALL=0
+WITH_HOST=0
+KEEP_IMAGES=0
 FROM_STAGE=""
 ONLY_STAGE=""
 
@@ -68,6 +74,15 @@ usage() { awk 'NR>1 && /^#/ { sub(/^# ?/, ""); print; next } NR>1 { exit }' "${B
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# Run a local command, or print it under --dry-run.
+run() {
+  if (( DRY_RUN )); then
+    printf '    would run: %s\n' "$*"
+  else
+    "$@"
+  fi
+}
+
 while (( $# )); do
   case "$1" in
     --ssh)             SSH_TARGET="${2:?--ssh needs user@host}"; shift ;;
@@ -76,6 +91,9 @@ while (( $# )); do
     --reconfigure)     RECONFIGURE=1 ;;
     --dry-run)         DRY_RUN=1 ;;
     --leave)           LEAVE=1 ;;
+    --uninstall)       UNINSTALL=1 ;;
+    --with-host)       WITH_HOST=1 ;;
+    --keep-images)     KEEP_IMAGES=1 ;;
     --from)            FROM_STAGE="${2:?--from needs a stage}"; shift ;;
     --only)            ONLY_STAGE="${2:?--only needs a stage}"; shift ;;
     -h|--help)         usage; exit 0 ;;
@@ -787,59 +805,206 @@ EOF
   ok "worker ready"
 }
 
-# ---------------------------------------------------------------- leave ---
+# ------------------------------------------------------------ uninstall ---
 
-# Undo, in the reverse order of the join: swarm first, because leaving the mesh
-# first would strand the node with no route to the manager.
-do_leave() {
-  info "removing $WHERE from the cluster"
+# The NFS-backed volumes this node cached. Not data: they are local handles on
+# an export that lives on the manager, and swarm caches a broken one on every
+# node it ever tried to schedule onto -- which is why a stale one survives a
+# redeploy and keeps failing. Detected by driver option rather than by name, so
+# a worker's own unrelated local volumes are never in the list.
+cached_nfs_volumes() {
+  host_eval 'docker volume ls -q 2>/dev/null | while read -r v; do
+    o=$(docker volume inspect -f "{{if .Options}}{{index .Options \"type\"}}{{end}}" "$v" 2>/dev/null) || o=""
+    [ "$o" = nfs ] && printf "%s\n" "$v"
+  done' 2>/dev/null | sed '/^$/d' || true
+}
 
-  if [[ "$(swarm_state)" == active ]]; then
-    if confirm "Leave the swarm?" yes; then
-      host_run 'docker swarm leave --force' || true
-      ok "left the swarm"
-      if manager_reachable && [[ -n "${WORKER_HOSTNAME:-}" ]]; then
-        # A node that left stays in `docker node ls` as Down until it is
-        # removed, and the placement constraints still see it.
-        if mgr_eval "docker node rm --force $WORKER_HOSTNAME" >/dev/null 2>&1; then
-          ok "removed $WORKER_HOSTNAME from the manager's node list"
-        else
-          warn "could not remove $WORKER_HOSTNAME on the manager; do it there with: docker node rm --force $WORKER_HOSTNAME"
-        fi
-      else
-        warn "run this on the manager to drop the stale node: docker node rm --force ${WORKER_HOSTNAME:-<hostname>}"
-      fi
+# The images the cluster's stacks name, read from the compose files here so the
+# list stays right as the stacks change. `docker compose config` parses a file
+# and needs no daemon; the grep is for a machine without the compose plugin.
+stack_images() {
+  local f
+  for f in apps/monitor/compose.yml apps/filebrowser/compose.yml traefik/compose.yml; do
+    [[ -f "$f" ]] || continue
+    if have docker && docker compose version >/dev/null 2>&1; then
+      docker compose -f "$f" config --images 2>/dev/null || true
+    else
+      sed -n 's/^[[:space:]]*image:[[:space:]]*//p' "$f" | tr -d "\"'" || true
     fi
+  done | sed '/\$/d' | sort -u
+}
+
+# Only the images this node actually pulled. Asking the worker keeps the plan
+# honest: a worker never runs traefik, so listing it would be noise.
+present_images() {
+  local want img
+  want="$(stack_images)" || want=""
+  [[ -n "$want" ]] || return 0
+  for img in $want; do
+    host_eval "docker image inspect $img >/dev/null 2>&1" && printf '%s\n' "$img"
+  done
+  return 0
+}
+
+# Undo the host changes this script recorded making, newest concern first.
+# Nothing that was already present when we arrived was recorded, so nothing
+# that predates the join is touched.
+undo_host() {
+  local state pm pkg was
+  state="$(host_eval "sudo cat $STATE_FILE 2>/dev/null")" || state=""
+  if [[ -z "$state" ]]; then
+    skip "no record of host changes; nothing to undo"
+    return 0
+  fi
+
+  printf '    this script recorded making these changes:\n'
+  printf '%s\n' "$state" | sed 's/^/      /'
+
+  if grep -qx 'installed_tailscale' <<< "$state"; then
+    host_run 'sudo apt-get purge -y tailscale tailscale-archive-keyring 2>/dev/null || sudo pacman -Rns --noconfirm tailscale 2>/dev/null || sudo dnf remove -y tailscale 2>/dev/null' || true
+    host_run 'sudo rm -f /etc/apt/sources.list.d/tailscale.list /usr/share/keyrings/tailscale-archive-keyring.gpg' || true
+  fi
+
+  while read -r _ pm pkg; do
+    [[ -n "${pkg:-}" ]] || continue
+    case "$pm" in
+      apt-get) host_run "sudo apt-get purge -y $pkg && sudo apt-get autoremove -y" || true ;;
+      pacman)  host_run "sudo pacman -Rns --noconfirm $pkg" || true ;;
+      dnf)     host_run "sudo dnf remove -y $pkg" || true ;;
+    esac
+  done < <(grep '^installed_package ' <<< "$state" || true)
+
+  if grep -qx 'loaded_nfs_module' <<< "$state"; then
+    host_run 'sudo rm -f /etc/modules-load.d/nfs-client.conf' || true
+  fi
+
+  # Last of the packages: removing docker earlier would take the daemon out
+  # from under every step above.
+  if grep -qx 'installed_docker' <<< "$state"; then
+    host_run 'sudo apt-get purge -y docker-ce docker-ce-cli containerd.io 2>/dev/null || sudo pacman -Rns --noconfirm docker 2>/dev/null || sudo dnf remove -y docker-ce 2>/dev/null' || true
+  fi
+
+  was="$(printf '%s\n' "$state" | grep -m1 '^hostname_was ' | cut -d' ' -f2-)" || true
+  if [[ -n "$was" ]]; then
+    if host_eval 'command -v hostnamectl >/dev/null 2>&1'; then
+      host_run "sudo hostnamectl set-hostname $was"
+    else
+      host_run "printf '%s\n' $was | sudo tee /etc/hostname >/dev/null && sudo hostname $was"
+    fi
+  fi
+
+  host_run "sudo rm -f $STATE_FILE"
+  ok "host changes undone"
+}
+
+# Remove this node from the cluster. --leave stops at cluster membership and
+# leaves the machine ready to re-join; --uninstall also drops the images, and
+# --with-host reverses what the host stage installed.
+do_uninstall() {
+  local what="leaving the cluster"
+  (( UNINSTALL )) && what="uninstalling"
+  info "$what on $WHERE"
+
+  local state vols imgs
+  state="$(swarm_state)"
+  vols="$(cached_nfs_volumes)" || vols=""
+  imgs=""
+  if (( UNINSTALL && ! KEEP_IMAGES )); then imgs="$(present_images)" || imgs=""; fi
+
+  printf '    swarm:   %s\n' "$([[ "$state" == active ]] && echo "leaving" || echo "not a member")"
+  printf '    mesh:    %s\n' "$(host_eval 'command -v tailscale >/dev/null 2>&1' && echo "logging out" || echo "tailscale not installed")"
+  printf '    volumes: %s\n' "${vols:-none cached}"
+  if (( ! UNINSTALL )); then
+    printf '    images:  kept (--uninstall removes them)\n'
+  elif (( KEEP_IMAGES )); then
+    printf '    images:  kept\n'
+  else
+    printf '    images:  %s\n' "${imgs:-none from this cluster are here}"
+  fi
+  if (( WITH_HOST )); then
+    printf '    %shost:    packages, the nfs module config, tailscale, docker and the hostname this script changed%s\n' "$RED" "$OFF"
+  else
+    printf '    host:    untouched (pass --with-host to undo what this script changed)\n'
+  fi
+  printf '    local:   %s\n' "$WORKER_ENV_FILE"
+
+  if (( ! DRY_RUN )); then
+    if [[ -t 0 ]]; then
+      local reply
+      read -rp "    Type this node's hostname (${WORKER_HOSTNAME:-?}) to confirm: " reply
+      [[ -n "${WORKER_HOSTNAME:-}" && "$reply" == "$WORKER_HOSTNAME" ]] || die "not confirmed; nothing was removed"
+    else
+      die "this needs a terminal to confirm on"
+    fi
+  fi
+
+  # 1. Leave the swarm first, so nothing is scheduled onto a node whose
+  #    volumes are about to disappear.
+  if [[ "$state" == active ]]; then
+    host_run 'docker swarm leave --force' || true
+    (( DRY_RUN )) || ok "left the swarm"
   else
     skip "not in a swarm"
   fi
 
+  # 2. Drop the stale node on the manager. A node that left stays in
+  #    `docker node ls` as Down, and the placement constraints still see it.
+  #    Before the mesh comes down, in case ssh to the manager runs over it.
+  if manager_reachable && [[ -n "${WORKER_HOSTNAME:-}" ]]; then
+    if (( DRY_RUN )); then
+      printf '    would run on %s: docker node rm --force %s\n' "$MANAGER_SSH" "$WORKER_HOSTNAME"
+    elif mgr_eval "docker node rm --force $WORKER_HOSTNAME" >/dev/null 2>&1; then
+      ok "removed $WORKER_HOSTNAME from the manager's node list"
+    else
+      warn "could not remove $WORKER_HOSTNAME on the manager; do it there with: docker node rm --force $WORKER_HOSTNAME"
+    fi
+  else
+    warn "run this on the manager to drop the stale node: docker node rm --force ${WORKER_HOSTNAME:-<hostname>}"
+  fi
+
+  # 3. The cached NFS volumes. Local handles only -- the files stay on the
+  #    manager -- and a stale one is what makes a re-join keep failing.
+  local v
+  for v in $vols; do
+    if (( DRY_RUN )); then
+      printf '    would run%s: docker volume rm %s\n' "${SSH_TARGET:+ on $SSH_TARGET}" "$v"
+    else
+      host_eval "docker volume rm $v >/dev/null 2>&1" && ok "removed volume $v" \
+        || warn "could not remove volume $v; something may still be using it"
+    fi
+  done
+
+  # 4. Images, on --uninstall only.
+  local img
+  for img in $imgs; do
+    if (( DRY_RUN )); then
+      printf '    would run%s: docker image rm %s\n' "${SSH_TARGET:+ on $SSH_TARGET}" "$img"
+    else
+      host_eval "docker image rm $img >/dev/null 2>&1" && ok "removed image $img" \
+        || skip "$img is still in use, or already gone"
+    fi
+  done
+
+  # 5. The mesh, after anything that might have needed it.
   if host_eval 'command -v tailscale >/dev/null 2>&1'; then
-    if confirm "Log out of the mesh?" yes; then
-      host_run 'sudo tailscale logout' || true
-      host_run 'sudo tailscale down' || true
+    host_run 'sudo tailscale logout 2>/dev/null; sudo tailscale down 2>/dev/null' || true
+    if (( ! DRY_RUN )); then
       ok "left the mesh"
-      warn "the node is still registered in headscale. Remove it in Headplane -> Machines, or: headscale nodes delete -i <id>"
+      warn "the node is still registered in headscale. Remove it in Headplane -> Machines, or on the manager: headscale nodes delete -i <id>"
     fi
   fi
 
-  # Only what this script installed, and only when it recorded doing so.
-  if recorded "installed_tailscale" && confirm "Uninstall tailscale, which this script installed?" no; then
-    host_run 'sudo apt-get remove -y tailscale || sudo pacman -Rns --noconfirm tailscale || sudo dnf remove -y tailscale' || true
-  fi
-  if recorded "installed_docker" && confirm "Uninstall docker, which this script installed?" no; then
-    host_run 'sudo apt-get remove -y docker-ce docker-ce-cli containerd.io || true' || true
+  # 6. Host changes, last: undoing docker would take the daemon out from under
+  #    every step above.
+  (( WITH_HOST )) && undo_host
+
+  if [[ -f "$WORKER_ENV_FILE" ]]; then
+    run rm -f "$WORKER_ENV_FILE"
+    (( DRY_RUN )) || ok "removed $WORKER_ENV_FILE"
   fi
 
-  local was
-  was="$(recorded_value hostname_was)" || was=""
-  if [[ -n "$was" ]] && confirm "Restore the hostname to $was?" no; then
-    host_run "sudo hostnamectl set-hostname $was" || true
-  fi
-
-  host_run "sudo rm -f $STATE_FILE" || true
-  [[ -f "$WORKER_ENV_FILE" ]] && confirm "Delete $WORKER_ENV_FILE?" yes && rm -f "$WORKER_ENV_FILE"
   ok "done"
+  return 0
 }
 
 # ------------------------------------------------------------------ run ---
@@ -850,8 +1015,8 @@ do_leave() {
 load_env_file "$WORKER_ENV_FILE"
 load_env_file "$ENV_FILE"
 
-if (( LEAVE )); then
-  do_leave
+if (( LEAVE || UNINSTALL )); then
+  do_uninstall
   exit 0
 fi
 
