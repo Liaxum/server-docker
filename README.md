@@ -66,10 +66,13 @@ Each host prerequisite offers to fix itself when it is missing:
     NFS client utilities are missing on root@liaxum.fr. Install them? [y/N]:
 ```
 
-`--with-host-setup` answers yes to all of them up front. Decline, or run with
-no terminal to answer, and the script stops with the command that fixes it —
-so a scripted run never changes a host without being told to, and never hangs
-waiting for an answer nobody can give.
+These default to yes, since preparing the host is what the script is for —
+Enter accepts, `n` declines. `--with-host-setup` answers them all up front.
+Declining stops with the command that fixes it, and a run with no terminal to
+answer on does the same rather than changing a host unasked or hanging.
+
+Removal is the exception: `--uninstall` asks for the manager hostname typed
+back, with no default.
 
 ### Startup mode
 

@@ -530,9 +530,11 @@ recorded_value() {
 # non-interactive runs fall through to the explicit failure instead of
 # hanging or silently changing a host.
 confirm() {
-  local reply
+  local reply def="${2:-no}" hint="[y/N]"
+  [[ "$def" == yes ]] && hint="[Y/n]"
   [[ -t 0 ]] || return 1
-  read -rp "    $1 [y/N]: " reply
+  read -rp "    $1 $hint: " reply
+  reply="${reply:-$def}"
   [[ "$reply" =~ ^[Yy] ]]
 }
 
@@ -541,7 +543,11 @@ confirm() {
 may_fix() {
   # Never prompt during a dry run: report the offer and carry on planning.
   (( DRY_RUN )) && { printf '    would ask: %s\n' "$1"; return 0; }
-  (( WITH_HOST_SETUP )) || confirm "$1"
+  # Default yes: preparing the host is what this script is for, and the
+  # alternative is the operator typing y to the same questions on every run.
+  # Declining is still one keystroke, and a run with no terminal still
+  # refuses rather than changing a host unasked.
+  (( WITH_HOST_SETUP )) || confirm "$1" yes
 }
 
 # The swarm records a node's hostname when it joins, and the placement
