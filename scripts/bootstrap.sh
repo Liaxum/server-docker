@@ -348,7 +348,8 @@ detect_pem() {
   case "$kind" in
     cert) candidates=("$CERT_DIR"/*cert* "$CERT_DIR"/*fullchain* "$CERT_DIR"/*.pem \
                       "$CERT_DIR"/*.crt "$CERT_DIR"/*.cer "$CERT_DIR"/*) ;;
-    key)  candidates=("$CERT_DIR"/*private* "$CERT_DIR"/*.key "$CERT_DIR"/*.pem "$CERT_DIR"/*) ;;
+    key)  candidates=("$CERT_DIR"/*private*.pem "$CERT_DIR"/*private*.key "$CERT_DIR"/*private* \
+                      "$CERT_DIR"/*.pem "$CERT_DIR"/*.key "$CERT_DIR"/*) ;;
   esac
   # For a certificate, prefer the file holding the most of them: a leaf and a
   # fullchain are both valid certificates and often differ only by extension,
@@ -365,7 +366,15 @@ detect_pem() {
         (( n < 1 )) && n=1
         if (( n > bestn )); then best="$f"; bestn="$n"; fi
         ;;
-      key)  openssl pkey -in "$f" -noout >/dev/null 2>&1 && { printf '%s' "$f"; return 0; } ;;
+      key)
+        openssl pkey -in "$f" -noout >/dev/null 2>&1 || continue
+        # Prefer one already in PEM, so nothing needs converting. Fall back to
+        # the first that parses at all.
+        if head -c 11 "$f" 2>/dev/null | grep -q -- '-----BEGIN '; then
+          printf '%s' "$f"; return 0
+        fi
+        [[ -n "$best" ]] || best="$f"
+        ;;
     esac
   done
   [[ -n "$best" ]] && { printf '%s' "$best"; return 0; }
