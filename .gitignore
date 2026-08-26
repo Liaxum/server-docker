@@ -9,3 +9,8 @@ traefik/secret/
 **/*.env
 
 games/azerothcore-wotlk
+
+# Rendered from *.template by scripts/bootstrap.sh
+apps/vpn/config.yaml
+apps/vpn/headplane_config.yaml
+bootstrap.env

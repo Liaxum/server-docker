@@ -1,6 +1,6 @@
 # Standalone compose (NOT a swarm stack): the kernel NFS server needs host
 # privileges and an AppArmor bypass that swarm services cannot be granted.
-# Deploy on liaxum-vps only:  docker compose -f apps/nfs/compose.yml up -d
+# Deploy on the manager node only:  docker compose -f apps/nfs/compose.yml up -d
 services:
   # Creates the shared directory tree before the server starts exporting it.
   # A swarm service that mounts a path missing from the export fails with
@@ -34,9 +34,13 @@ services:
     ports:
       # Bound to the Tailscale IP so the export is never reachable from the
       # public interface.
-      - "100.64.0.1:2049:2049"
+      - "${MESH_ADDR:-100.64.0.1}:2049:2049"
     volumes:
       - nfs_data:/shared
+      # The server is the host's kernel nfsd, not something in the image, so
+      # it needs the host's modules to load nfsd and nfs. Without this the
+      # container exits at startup and every mount gets connection refused.
+      - /lib/modules:/lib/modules:ro
     environment:
       # fsid=0 makes /shared the NFSv4 root. It is a bind-mounted Docker
       # volume, so it lives in this container's mount namespace and nfsd
@@ -46,8 +50,10 @@ services:
       # /shared IS the root, clients address paths relative to it:
       # /shared/monitor-keys on the server is :/monitor-keys to a client.
       #
-      # Two client specs: 100.64.0.0/10 for worker nodes arriving over
-      # Tailscale, 172.16.0.0/12 for the VPS mounting its own export through
+      # Two client specs: MESH_CIDR for worker nodes arriving over Tailscale
+      # -- it must match headscale prefixes.v4, or nodes get addresses this
+      # export refuses -- and 172.16.0.0/12 for the VPS mounting its own
+      # export through
       # the published port, where the source address is NAT'd to the Docker
       # bridge gateway. The listener is bound to 100.64.0.1, so the second
       # spec is reachable only from this host and its containers.
@@ -59,7 +65,7 @@ services:
       #
       # Squashing to root lets a client create setuid-root files on the share,
       # so every client mounts it nosuid,nodev. Nothing here is executed.
-      - "NFS_EXPORT_0=/shared 100.64.0.0/10(rw,sync,no_subtree_check,all_squash,anonuid=0,anongid=0,fsid=0) 172.16.0.0/12(rw,sync,no_subtree_check,all_squash,anonuid=0,anongid=0,fsid=0)"
+      - "NFS_EXPORT_0=/shared ${MESH_CIDR:-100.64.0.0/10}(rw,sync,no_subtree_check,all_squash,anonuid=0,anongid=0,fsid=0) 172.16.0.0/12(rw,sync,no_subtree_check,all_squash,anonuid=0,anongid=0,fsid=0)"
 
 volumes:
   nfs_data:

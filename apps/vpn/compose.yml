@@ -3,10 +3,17 @@ networks:
     external: true
 
 configs:
+  # Docker config objects are immutable, so re-rendering these with changed
+  # content cannot update them in place ("only updates to Labels are allowed").
+  # Naming them after a hash of their content makes a change create a new
+  # object that the service is pointed at instead. bootstrap.sh sets the
+  # hashes; the defaults keep a manual deploy working.
   headscale_config:
     file: ./config.yaml
+    name: headscale_config_${HEADSCALE_CONFIG_HASH:-manual}
   headplane_config:
     file: ./headplane_config.yaml
+    name: headplane_config_${HEADPLANE_CONFIG_HASH:-manual}
 
 services:
   core:
@@ -33,7 +40,7 @@ services:
           - node.role == manager
       labels:
         - "traefik.enable=true"
-        - "traefik.http.routers.headscale.rule=Host(`vpn.liaxum.fr`)"
+        - "traefik.http.routers.headscale.rule=Host(`${VPN_SUBDOMAIN:-vpn}.${DOMAIN:-liaxum.fr}`)"
         - "traefik.http.routers.headscale.entrypoints=websecure"
         - "traefik.http.routers.headscale.tls=true"
         - "traefik.http.routers.headscale.tls.certresolver=letsencrypt"
@@ -51,7 +58,7 @@ services:
       labels:
         - "traefik.enable=true"
         # Access it via a specific subdomain or path
-        - "traefik.http.routers.headplane.rule=Host(`vpn.liaxum.fr`) && PathPrefix(`/admin`)"
+        - "traefik.http.routers.headplane.rule=Host(`${VPN_SUBDOMAIN:-vpn}.${DOMAIN:-liaxum.fr}`) && PathPrefix(`/admin`)"
         - "traefik.http.routers.headplane.entrypoints=websecure"
         - "traefik.http.routers.headplane.tls=true"
         - "traefik.http.services.headplane.loadbalancer.server.port=3000"

@@ -18,11 +18,11 @@ services:
     deploy:
       placement:
         constraints:
-          - node.hostname == liaxum-vps
+          - node.hostname == ${MANAGER_HOSTNAME:-liaxum-vps}
       labels:
         - "traefik.enable=true"
         - "traefik.swarm.network=web-net"
-        - "traefik.http.routers.files.rule=Host(`files.liaxum.fr`)"
+        - "traefik.http.routers.files.rule=Host(`${FILES_SUBDOMAIN:-files}.${DOMAIN:-liaxum.fr}`)"
         - "traefik.http.routers.files.entrypoints=websecure"
         - "traefik.http.routers.files.tls=true"
         - "traefik.http.services.files.loadbalancer.server.port=80"
@@ -34,5 +34,5 @@ networks:
 volumes:
   config:
   nfs_data:
-    # Created by apps/nfs/compose.yml on liaxum-vps.
+    # Created by apps/nfs/compose.yml on the manager node.
     external: true
