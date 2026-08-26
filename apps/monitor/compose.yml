@@ -47,7 +47,9 @@ services:
       - PERIPHERY_CORE_ADDRESS=wss://${MONITOR_SUBDOMAIN:-monitor}.${DOMAIN:-liaxum.fr}
       - PERIPHERY_CONNECT_AS={{ .Node.Hostname }}
       - PERIPHERY_CORE_PUBLIC_KEYS=file:/config/keys/core.pub
-      - PERIPHERY_ONBOARDING_KEY=O_MtvPL47OpYgEqArluFsbv6nXjR0U_O
+      # Created in the Komodo UI once core is running, so it cannot be known
+      # at first deploy. bootstrap.sh asks for it and redeploys.
+      - PERIPHERY_ONBOARDING_KEY=${KOMODO_ONBOARDING_KEY:-}
     volumes:
       - keys:/config/keys
       - /var/run/docker.sock:/var/run/docker.sock

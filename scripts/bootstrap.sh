@@ -278,6 +278,7 @@ MONITOR_STACK=$MONITOR_STACK
 MONITOR_SUBDOMAIN=$MONITOR_SUBDOMAIN
 MCP_SUBDOMAIN=$MCP_SUBDOMAIN
 MESH_USER=$MESH_USER
+KOMODO_ONBOARDING_KEY=$KOMODO_ONBOARDING_KEY
 CRT_FILE=$CRT_FILE
 KEY_FILE=$KEY_FILE
 HEADPLANE_API_KEY=$HEADPLANE_API_KEY
@@ -322,6 +323,9 @@ stage_config() {
 
   ask MESH_USER "Headscale user to enrol nodes under" "admin"
   [[ "$MESH_USER" =~ ^[A-Za-z0-9._-]+$ ]] || die "MESH_USER '$MESH_USER' is not a valid name"
+
+  # Blank until core exists to create one; the monitor stage asks again.
+  ask KOMODO_ONBOARDING_KEY "Komodo onboarding key (blank to set it later)" "" "" optional
 
   ask HEADPLANE_API_KEY       "Headplane API key (blank to fill in later)" "" "" optional
   ask HEADPLANE_COOKIE_SECRET "Headplane cookie secret" "$(openssl rand -hex 16 2>/dev/null || head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
@@ -760,7 +764,53 @@ stage_filebrowser() {
     skip "no generated password in the log: its database already existed, so an earlier password still applies"
   fi
 }
-stage_monitor()     { info "komodo";      deploy apps/monitor/compose.yml "$MONITOR_STACK"; }
+stage_monitor() {
+  info "komodo"
+  deploy apps/monitor/compose.yml "$MONITOR_STACK"
+  (( DRY_RUN )) && return 0
+  [[ -n "${KOMODO_ONBOARDING_KEY:-}" ]] && return 0
+
+  # The agent registers with core using an onboarding key, and that key can
+  # only be created once core is running -- so a first deploy cannot have it.
+  # Wait for core, then ask.
+  local attempt=0 replicas
+  printf '    waiting for komodo core' >&2
+  while (( attempt < 24 )); do
+    replicas="$(docker service ls --filter "name=${MONITOR_STACK}_core" --format '{{.Replicas}}' 2>/dev/null | head -1)" || true
+    [[ "$replicas" == "1/1" ]] && break
+    printf '.' >&2
+    attempt=$((attempt + 1))
+    sleep 5
+  done
+  printf '\n' >&2
+
+  if [[ ! -t 0 ]]; then
+    warn "no onboarding key set, and no terminal to ask on. The agent will not register until KOMODO_ONBOARDING_KEY is set and this stage is re-run."
+    return 0
+  fi
+
+  cat >&2 <<EOF
+
+The agent registers with core using an onboarding key, which only exists once
+core is running -- so it could not be set before now.
+
+Create one at https://$MONITOR_SUBDOMAIN.$DOMAIN and paste it here. Leaving it
+blank is fine; re-run "$0 --only monitor" when you have one.
+
+EOF
+  local key
+  read -rp "    Komodo onboarding key: " key
+  key="$(printf '%s' "$key" | tr -d '[:space:]')"
+  if [[ -z "$key" ]]; then
+    skip "no key given; the agent will not register yet"
+    return 0
+  fi
+
+  KOMODO_ONBOARDING_KEY="$key"
+  write_env
+  ok "saved the onboarding key; redeploying so the agent picks it up"
+  deploy apps/monitor/compose.yml "$MONITOR_STACK"
+}
 
 # Headplane authenticates to headscale with an API key. Leaving it blank
 # renders a config whose UI cannot read anything, so mint one and keep it.

@@ -205,6 +205,7 @@ beforehand overrides the stored value.
 | `*_SUBDOMAIN` | subdomains: `VPN_`, `FILES_`, `MONITOR_`, `MCP_` |
 | `CRT_FILE` / `KEY_FILE` | TLS material; detected in `traefik/secret/` by content |
 | `MESH_USER` | headscale user that nodes enrol under |
+| `KOMODO_ONBOARDING_KEY` | created in Komodo once core runs; the monitor stage asks |
 | `HEADPLANE_API_KEY` | minted in headplane, so blank on a first run |
 | `HEADPLANE_COOKIE_SECRET` | generated if you accept the default |
 
@@ -241,6 +242,12 @@ mismatched pair otherwise deploys cleanly and fails TLS at runtime. A leaf
 with no intermediates is flagged — browsers cope, Go clients such as Tailscale
 do not — and the script offers to build the chain by fetching the issuer the
 certificate itself names.
+
+The `monitor` stage has the same shape of problem as `mesh`: the agent
+registers with core using an onboarding key, and that key can only be created
+once core is running. So the stage deploys, waits for core, asks for the key,
+saves it and redeploys. Leaving it blank is fine — everything else comes up,
+and `--only monitor` picks up where you left off.
 
 The `mesh` stage joins the node for you: it offers to install Tailscale, mints
 a headscale pre-auth key through the running `<vpn stack>_core` container, and
