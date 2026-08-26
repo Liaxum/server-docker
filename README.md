@@ -6,7 +6,8 @@ centralized NFS persistent storage and a Traefik reverse proxy.
 - **Manager node:** `liaxum-vps` — Tailscale IP `100.64.0.1`. Everything that
   holds state is pinned to it via `node.hostname == liaxum-vps`.
 - **Worker nodes:** remote physical hardware (gaming PC, mini PC) joined to
-  both the Swarm and the Tailscale mesh.
+  both the Swarm and the Tailscale mesh — see
+  [Joining a worker node](#joining-a-worker-node).
 - **Reverse proxy:** Traefik on the manager, terminating TLS on the `web-net`
   overlay network.
 
@@ -16,13 +17,17 @@ centralized NFS persistent storage and a Traefik reverse proxy.
 | `apps/nfs/compose.yml` | **standalone compose** on the VPS | exports `/shared` over Tailscale |
 | `apps/filebrowser/compose.yml` | stack `files` | web UI on the shared volume |
 | `apps/monitor/compose.yml` | stack `monitor` | Komodo core, Mongo, global agents, MCP |
+| `scripts/bootstrap.sh` | — | brings the manager up from nothing |
+| `scripts/join-worker.sh` | — | adds a worker to the mesh, then the swarm |
 
 ## Host prerequisites
 
 ### NFS client utilities (every node)
 
 The Docker `local` volume driver hands NFS mounts to the kernel, so the client
-tools must be present on the host — not just in the container.
+tools must be present on the host — not just in the container. Both scripts
+install these, so this is what they do rather than something to run by hand:
+`bootstrap.sh` on the manager, `join-worker.sh` on every worker.
 
 ```bash
 # Debian / Ubuntu
@@ -325,6 +330,96 @@ verify`.
 `verify` waits up to `VERIFY_WAIT` seconds (180 by default) for services to
 converge before reporting anything unhealthy — pulling images on a cold host
 is the slow part, and a service still starting is not a broken one.
+
+## Joining a worker node
+
+`bootstrap.sh` builds the manager. `join-worker.sh` adds everything else:
+
+```bash
+./scripts/join-worker.sh                                   # on the worker itself
+./scripts/join-worker.sh --ssh user@gamingpc               # repo here, worker there
+./scripts/join-worker.sh --ssh user@gamingpc --manager root@vps   # nothing to copy by hand
+./scripts/join-worker.sh --only verify                     # just check
+./scripts/join-worker.sh --leave                           # undo
+```
+
+The stages are `config host mesh swarm verify`, and the order is the point.
+The manager advertises its mesh address, so `100.64.0.1:2377` does not resolve
+to anything reachable until the node is on the tailnet — Tailscale has to come
+first. And a worker that joins without `--advertise-addr` lets Docker pick an
+interface, usually the LAN or public one, which puts the overlay back on the
+internet even though the join itself went over the mesh. The script always
+passes the address headscale handed out.
+
+`host` installs Docker, the NFS *client* utilities and the `nfs` kernel module
+— not `nfsd`, which is the server's and runs only on the manager — and sets
+the hostname before the swarm records it. Each change is offered individually
+and defaults to yes; `--with-host-setup` accepts them all.
+
+### With and without `--manager`
+
+`--manager` is ssh access to the manager, and it is optional.
+
+**With it**, the pre-auth key and the join token are read off the manager
+directly and the run is unattended. It also checks the manager is advertising
+its mesh address before joining, and refuses if it is not — joining a manager
+still on its public address is exactly the thing this design exists to avoid,
+and it cannot be fixed after the fact on the manager side.
+
+**Without it**, the node asks headscale to register it and prints the key for
+Headplane:
+
+```
+Register this node in Headplane:
+
+  1. open https://vpn.liaxum.fr/admin -> Machines -> Register Machine Key
+  2. paste this, and pick the owner 'admin':
+
+     https://vpn.liaxum.fr/register/nodekey:...
+```
+
+Headplane has no pre-auth key dialog — key creation is CLI-only — but its
+Machines page takes exactly this registration key, so the whole enrolment can
+happen in the browser. The script waits, then continues once the address
+arrives. It then asks for the output of `docker swarm join-token -q worker`.
+
+The join token is deliberately never stored: it rotates, and a stale one fails
+in a way that reads like a network problem.
+
+### What `verify` actually proves
+
+Membership in `docker node ls` does not mean the node can do its job. The
+Komodo agent mounts the shared keys over NFS, and Docker reports a failed
+volume mount as a scheduling problem — so `verify` mounts
+`100.64.0.1:/monitor-keys` itself, writes a file, removes it and unmounts:
+
+```
+  ok mesh address: 100.64.0.5
+  ok swarm: active
+  ok mounted and wrote to 100.64.0.1:/monitor-keys over the mesh
+  ok docker node ls: gamingpc Ready Active
+  ok monitor_agent on this node: Running 40 seconds ago
+```
+
+If port 2049 is unreachable it names the rule to add on the manager
+(`ufw allow in on tailscale0 to any port 2049 proto tcp`), and if the mount is
+refused it points at the `fsid=0` root rather than leaving you to guess.
+
+The last two lines need `--manager`; without it they are skipped with a note.
+
+### Settings, and removing a worker
+
+Cluster-wide answers come from `bootstrap.env` when the checkout has one, so
+the repo that built the manager joins workers without asking twice. This
+script never writes that file. Its own answers go to `worker.env`, or
+`worker-<target>.env` when `--ssh` is given, so several workers can be driven
+from one checkout.
+
+`--leave` undoes the join in reverse: swarm first, because leaving the mesh
+first strands the node with no route to the manager. It removes the stale
+`Down` node from `docker node ls` when `--manager` is given, and reverses only
+the host changes it recorded in `/var/lib/server-docker-worker.state`. The node
+stays registered in headscale — delete it in Headplane → Machines.
 
 ## Bring-up order
 
