@@ -37,6 +37,10 @@ services:
       - "${MESH_ADDR:-100.64.0.1}:2049:2049"
     volumes:
       - nfs_data:/shared
+      # The server is the host's kernel nfsd, not something in the image, so
+      # it needs the host's modules to load nfsd and nfs. Without this the
+      # container exits at startup and every mount gets connection refused.
+      - /lib/modules:/lib/modules:ro
     environment:
       # fsid=0 makes /shared the NFSv4 root. It is a bind-mounted Docker
       # volume, so it lives in this container's mount namespace and nfsd

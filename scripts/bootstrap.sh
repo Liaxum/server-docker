@@ -588,6 +588,22 @@ ensure_nfs_client() {
   fi
 }
 
+# nfsd runs in the host kernel; the container only drives it. If the modules
+# are not loaded the server exits immediately and the mounts that depend on it
+# fail with connection refused, which points nowhere useful.
+ensure_nfs_kernel() {
+  local where="${SSH_TARGET:-this machine}"
+  host_eval 'lsmod 2>/dev/null | grep -q "^nfsd"' && { skip "nfsd module loaded"; return; }
+
+  may_fix "the nfsd kernel module is not loaded on $where, so the NFS server cannot start. Load it?" \
+    || { blocker "nfsd is not loaded on $where. Load it with: sudo modprobe nfs nfsd"; return; }
+
+  host_run 'sudo modprobe nfs && sudo modprobe nfsd'
+  # Survive a reboot, or the cluster comes back without storage.
+  host_run "printf 'nfs\\nnfsd\\n' | sudo tee /etc/modules-load.d/nfs.conf >/dev/null"
+  record "loaded_nfs_modules"
+}
+
 ensure_swarm() {
   swarm_active && { skip "swarm already initialised"; return; }
 
@@ -638,6 +654,7 @@ stage_host() {
 
   ensure_hostname
   ensure_nfs_client
+  ensure_nfs_kernel
   ensure_swarm
   ensure_vpn_dir
   ensure_ufw_rule
@@ -1139,6 +1156,10 @@ undo_host() {
       pacman)  host_run "sudo pacman -Rns --noconfirm $pkg" || true ;;
     esac
   done < <(grep '^installed_package ' <<< "$state" || true)
+
+  if grep -qx 'loaded_nfs_modules' <<< "$state"; then
+    host_run 'sudo rm -f /etc/modules-load.d/nfs.conf' || true
+  fi
 
   if grep -qx 'created_dir /opt/vpn/data' <<< "$state"; then
     if (( WITH_DATA )); then
