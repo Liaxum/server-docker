@@ -610,6 +610,28 @@ EOF
   printf '%s' "$token"
 }
 
+# What the manager tells this node its managers are, read from the worker
+# itself. This is the advertised address, which is the one that matters: the
+# manager's daemon listens on every interface, so joining over
+# 100.64.0.1:2377 succeeds even when it advertises a public address -- and
+# then hands this node that public address for overlay traffic. So a
+# successful join proves nothing, and --manager is not needed to catch it.
+check_remote_managers() {
+  local addrs
+  addrs="$(host_eval "docker info --format '{{range .Swarm.RemoteManagers}}{{.Addr}} {{end}}' 2>/dev/null")" || addrs=""
+  addrs="$(printf '%s' "$addrs" | tr -s '[:space:]' ' ')"
+  [[ -n "${addrs// /}" ]] || return 0        # older daemons omit the field
+
+  case " $addrs " in
+    *" $MESH_ADDR:"*) ok "the manager advertises $MESH_ADDR"; return 0 ;;
+  esac
+
+  warn "the swarm's manager is ${addrs% }, not $MESH_ADDR. That is the address it advertises, so this node's overlay traffic goes there rather than over the mesh -- the join succeeded because the manager listens on every interface, not because it is on the mesh."
+  warn "fix it on the manager, then re-run --leave and this script:"
+  warn "  ./scripts/bootstrap.sh --ssh <manager> --from mesh"
+  return 1
+}
+
 # Refuse to join over anything but the mesh. Joining a manager that advertises
 # its public address is what puts the overlay back on the internet, and it is
 # fixed at init on the manager -- so it has to be caught here, not after.
@@ -646,6 +668,7 @@ stage_swarm() {
     else
       skip "already in a swarm${addr:+, advertising $addr}"
     fi
+    check_remote_managers || true
     return
   fi
 
@@ -666,6 +689,7 @@ stage_swarm() {
   host_run "docker swarm join --token $token --advertise-addr $WORKER_MESH_ADDR $MESH_ADDR:2377"
   record "swarm_joined"
   ok "joined the swarm as $WORKER_HOSTNAME, advertising $WORKER_MESH_ADDR"
+  check_remote_managers || true
 }
 
 # The one thing nothing else proves: that this node can actually mount the
@@ -723,6 +747,7 @@ stage_verify() {
     failed=1
   fi
 
+  check_remote_managers || failed=1
   verify_nfs || failed=1
 
   if manager_reachable; then

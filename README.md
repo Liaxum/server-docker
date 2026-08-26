@@ -361,12 +361,13 @@ and defaults to yes; `--with-host-setup` accepts them all.
 `--manager` is ssh access to the manager, and it is optional.
 
 **With it**, the pre-auth key and the join token are read off the manager
-directly and the run is unattended. It also checks the manager is advertising
-its mesh address before joining, and refuses if it is not — joining a manager
-still on its public address is exactly the thing this design exists to avoid,
-and it cannot be fixed after the fact on the manager side.
+directly and the run is unattended, and `verify` can check `docker node ls` and
+where the Komodo agent landed. `--leave` can also drop the stale `Down` node.
 
-**Without it**, the node asks headscale to register it and prints the key for
+**Without it**, none of that is lost, only done by hand — and the one check
+that actually matters happens either way, see below.
+
+For enrolment, the node asks headscale to register it and prints the key for
 Headplane:
 
 ```
@@ -385,6 +386,36 @@ arrives. It then asks for the output of `docker swarm join-token -q worker`.
 
 The join token is deliberately never stored: it rotates, and a stale one fails
 in a way that reads like a network problem.
+
+### Why a successful join proves nothing
+
+The manager's daemon listens on every interface, so
+`docker swarm join ... 100.64.0.1:2377` succeeds **even when the manager
+advertises its public address** — and then hands this node that public address
+for overlay traffic. The join going over the mesh does not mean the cluster
+does.
+
+So after joining, the worker reads back what the manager told it:
+
+```bash
+docker info --format '{{range .Swarm.RemoteManagers}}{{.Addr}} {{end}}'
+```
+
+That is the advertised address, and the script checks it on every run of the
+`swarm` and `verify` stages. It needs no ssh to the manager, which is why
+`--manager` stays a convenience rather than a requirement:
+
+```
+warn the swarm's manager is 203.0.113.10:2377, not 100.64.0.1. That is the
+     address it advertises, so this node's overlay traffic goes there rather
+     than over the mesh -- the join succeeded because the manager listens on
+     every interface, not because it is on the mesh.
+```
+
+The fix is on the manager (`bootstrap.sh --from mesh`, see
+[Moving the swarm onto the mesh](#moving-the-swarm-onto-the-mesh)), then
+`--leave` and re-join. Daemons too old to report the field are left alone
+rather than warned about.
 
 ### What `verify` actually proves
 
