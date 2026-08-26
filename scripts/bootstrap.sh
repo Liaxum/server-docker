@@ -728,7 +728,31 @@ deploy() {
 }
 
 stage_traefik()     { info "traefik";     deploy traefik/compose.yml "$TRAEFIK_STACK"; }
-stage_filebrowser() { info "filebrowser"; deploy apps/filebrowser/compose.yml "$FILES_STACK"; }
+stage_filebrowser() {
+  info "filebrowser"
+  deploy apps/filebrowser/compose.yml "$FILES_STACK"
+  (( DRY_RUN )) && return 0
+
+  # Filebrowser prints a generated admin password once, when it creates its
+  # database. Telling the operator to go and grep for it is the same mistake
+  # as hiding the headplane key, so read it out here.
+  local line attempt=0
+  while (( attempt < 6 )); do
+    line="$(docker service logs "${FILES_STACK}_core" 2>&1 | grep -i 'password' | tail -1)" || true
+    [[ -n "$line" ]] && break
+    attempt=$((attempt + 1))
+    sleep 3
+  done
+
+  if [[ -n "${line:-}" ]]; then
+    printf '\n    %sfilebrowser -- sign in at https://%s.%s%s\n' \
+      "$BOLD" "$FILES_SUBDOMAIN" "$DOMAIN" "$OFF"
+    printf '    user: admin\n'
+    printf '    %s\n\n' "$line"
+  else
+    skip "no generated password in the log: its database already existed, so an earlier password still applies"
+  fi
+}
 stage_monitor()     { info "komodo";      deploy apps/monitor/compose.yml "$MONITOR_STACK"; }
 
 # Headplane authenticates to headscale with an API key. Leaving it blank
