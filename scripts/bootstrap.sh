@@ -350,14 +350,80 @@ detect_pem() {
                       "$CERT_DIR"/*.crt "$CERT_DIR"/*.cer "$CERT_DIR"/*) ;;
     key)  candidates=("$CERT_DIR"/*private* "$CERT_DIR"/*.key "$CERT_DIR"/*.pem "$CERT_DIR"/*) ;;
   esac
+  # For a certificate, prefer the file holding the most of them: a leaf and a
+  # fullchain are both valid certificates and often differ only by extension,
+  # and serving the leaf alone is what breaks Go clients. Content decides,
+  # not the name.
+  local best="" bestn=0 n
   for f in "${candidates[@]}"; do
     [[ -f "$f" ]] || continue
     case "$kind" in
-      cert) openssl x509 -in "$f" -noout >/dev/null 2>&1 && { printf '%s' "$f"; return 0; } ;;
+      cert)
+        openssl x509 -in "$f" -noout >/dev/null 2>&1 || continue
+        n="$(grep -c -- '-----BEGIN CERTIFICATE-----' "$f" 2>/dev/null || echo 1)"
+        if (( n > bestn )); then best="$f"; bestn="$n"; fi
+        ;;
       key)  openssl pkey -in "$f" -noout >/dev/null 2>&1 && { printf '%s' "$f"; return 0; } ;;
     esac
   done
+  [[ -n "$best" ]] && { printf '%s' "$best"; return 0; }
   return 1
+}
+
+# A certificate names where to fetch its issuer, in the Authority Information
+# Access extension. Follow that rather than asking for a CA bundle nobody can
+# find: it is the same file the CA ships, from the CA.
+build_fullchain() {
+  local out="${CRT_FILE%.*}_fullchain.pem" url tmp next depth=0
+  have openssl && have curl || { warn "openssl and curl are needed to build the chain"; return 1; }
+
+  may_fix "Fetch the issuer named by the certificate and build a full chain?" || return 1
+
+  tmp="$(mktemp -d)" || return 1
+  cp "$CRT_FILE" "$tmp/chain.pem" || { rm -rf "$tmp"; return 1; }
+  next="$CRT_FILE"
+
+  # Walk up until the issuer stops naming another one, which is the root.
+  while (( depth < 4 )); do
+    url="$(openssl x509 -in "$next" -noout -text 2>/dev/null \
+           | grep -A1 'Authority Information Access' \
+           | grep -o 'CA Issuers - URI:.*' | sed 's/CA Issuers - URI://' | tr -d '[:space:]')" || true
+    [[ -n "$url" ]] || break
+
+    if ! curl -fsSL --max-time 20 "$url" -o "$tmp/issuer.raw" 2>/dev/null; then
+      warn "could not fetch $url"
+      break
+    fi
+    # CAs serve these as DER as often as PEM.
+    if ! openssl x509 -in "$tmp/issuer.raw" -out "$tmp/issuer.pem" 2>/dev/null; then
+      openssl x509 -inform DER -in "$tmp/issuer.raw" -out "$tmp/issuer.pem" 2>/dev/null \
+        || { warn "fetched $url but could not read it as a certificate"; break; }
+    fi
+
+    # Stop at the root: it is self-signed and browsers already trust it.
+    if [[ "$(openssl x509 -in "$tmp/issuer.pem" -noout -subject 2>/dev/null)" == \
+          "$(openssl x509 -in "$tmp/issuer.pem" -noout -issuer 2>/dev/null | sed 's/^issuer=/subject=/')" ]]; then
+      break
+    fi
+
+    cat "$tmp/issuer.pem" >> "$tmp/chain.pem"
+    cp "$tmp/issuer.pem" "$tmp/next.pem"
+    next="$tmp/next.pem"
+    depth=$((depth + 1))
+  done
+
+  if (( depth == 0 )); then
+    warn "the certificate names no issuer to fetch; ask your CA for the intermediate bundle"
+    rm -rf "$tmp"
+    return 1
+  fi
+
+  cp "$tmp/chain.pem" "$out" || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"
+  CRT_FILE="$out"
+  write_env
+  ok "built $out with $((depth + 1)) certificates, and set CRT_FILE to it"
+  return 0
 }
 
 # A mismatched pair deploys happily and then fails TLS at runtime, so compare
@@ -392,7 +458,8 @@ check_cert_pair() {
   local certs
   certs="$(grep -c -- '-----BEGIN CERTIFICATE-----' "$CRT_FILE" 2>/dev/null || echo 0)"
   if [[ "$certs" -le 1 ]]; then
-    warn "$CRT_FILE holds a single certificate, so the intermediate chain is missing. Browsers usually cope; Go clients (tailscale, and anything else dialling these hosts) do not. Concatenate the CA's intermediates after the leaf: cat leaf.cer intermediate.cer > fullchain.pem"
+    warn "$CRT_FILE holds a single certificate, so the intermediate chain is missing. Browsers usually cope; Go clients (tailscale, and anything else dialling these hosts) do not."
+    build_fullchain && certs="$(grep -c -- '-----BEGIN CERTIFICATE-----' "$CRT_FILE" 2>/dev/null || echo 0)"
   fi
 
   local expiry
