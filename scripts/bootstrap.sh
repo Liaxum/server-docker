@@ -1070,7 +1070,30 @@ stage_verify() {
     return
   fi
 
-  local failed=0 svc replicas
+  local svc replicas attempt=0 pending=1
+
+  # Services are still converging when this runs -- it is called seconds after
+  # the deploys -- so retry before calling anything unhealthy. Reporting a
+  # restart in progress as a failure sends people to inspect a healthy service.
+  while (( pending && attempt < 12 )); do
+    pending=0
+    for svc in "${TRAEFIK_STACK}_core" "${VPN_STACK}_core" "${VPN_STACK}_web" \
+               "${FILES_STACK}_core" "${MONITOR_STACK}_db" "${MONITOR_STACK}_core" \
+               "${MONITOR_STACK}_agent" "${MONITOR_STACK}_mcp"; do
+      replicas="$(docker service ls --filter "name=$svc" --format '{{.Replicas}}' 2>/dev/null | head -1)" || true
+      [[ -z "$replicas" ]] && continue                      # not deployed: reported below
+      [[ "${replicas%%/*}" == "${replicas##*/}" ]] && continue
+      pending=1
+    done
+    (( pending )) || break
+    attempt=$((attempt + 1))
+    (( attempt == 1 )) && printf '    waiting for services to converge' >&2
+    printf '.' >&2
+    sleep 5
+  done
+  (( attempt )) && printf '\n' >&2
+
+  local failed=0
   for svc in "${TRAEFIK_STACK}_core" "${VPN_STACK}_core" "${VPN_STACK}_web" \
              "${FILES_STACK}_core" "${MONITOR_STACK}_db" "${MONITOR_STACK}_core" \
              "${MONITOR_STACK}_agent" "${MONITOR_STACK}_mcp"; do
@@ -1080,6 +1103,9 @@ stage_verify() {
       failed=1
     elif [[ "${replicas%%/*}" == "${replicas##*/}" && "${replicas%%/*}" != 0 ]]; then
       ok "$svc: $replicas"
+    elif [[ "$replicas" == "0/0" ]]; then
+      # A global service with no eligible node is not a failure.
+      ok "$svc: $replicas (no node to place it on)"
     else
       warn "$svc: $replicas -- inspect with: docker service ps --no-trunc $svc"
       failed=1
