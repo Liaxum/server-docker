@@ -131,6 +131,16 @@ fi
 
 WHERE="${SSH_TARGET:-this machine}"
 
+# Say this once, up front. Over ssh the prompts appear inline between steps,
+# which is confusing if you were not expecting them -- and a wrong password
+# makes a step fail in a way that looks like the step itself broke.
+warn_if_sudo_prompts() {
+  (( DRY_RUN )) && return 0
+  host_eval 'sudo -n true' >/dev/null 2>&1 && return 0
+  host_eval 'test "$(id -u)" = 0' >/dev/null 2>&1 && return 0
+  warn "sudo on $WHERE asks for a password, so this run will prompt for it several times, between steps. A wrong one makes that step fail on its own -- re-running is safe."
+}
+
 # --------------------------------------------------------------- helpers ---
 
 # Read-only check on the worker. Always executes, including under --dry-run:
@@ -183,12 +193,20 @@ may_fix() {
   (( WITH_HOST_SETUP )) || confirm "$1" yes
 }
 
-# Note a change we made on the worker, so --leave can undo exactly that.
+# Note a change we made on the worker, so the uninstall can undo exactly that.
 # Anything that was already there when we arrived is never recorded, and so is
 # never removed.
+#
+# A failure here is not fatal -- the join still worked -- but it is not silent
+# either: an unwritten state file means --uninstall --with-host will later find
+# nothing to reverse and say the host was never touched, which would be wrong.
+RECORD_FAILED=0
 record() {
   (( DRY_RUN )) && return 0
-  host_run "printf '%s\n' '$1' | sudo tee -a $STATE_FILE >/dev/null" || true
+  if ! host_run "printf '%s\n' '$1' | sudo tee -a $STATE_FILE >/dev/null"; then
+    (( RECORD_FAILED )) || warn "could not write $STATE_FILE on $WHERE (sudo). Host changes are not being recorded, so '--uninstall --with-host' will not be able to reverse them -- undo them by hand, or re-run this stage once sudo works."
+    RECORD_FAILED=1
+  fi
 }
 
 recorded() { host_eval "sudo grep -qxF '$1' $STATE_FILE 2>/dev/null"; }
@@ -716,26 +734,57 @@ stage_swarm() {
 # five-minute fix and an afternoon.
 verify_nfs() {
   local mnt=/tmp/join-worker-nfs-probe
+  local log=/tmp/join-worker-nfs-probe.log
 
   if ! host_eval "timeout 5 bash -c '</dev/tcp/$MESH_ADDR/2049' 2>/dev/null"; then
     warn "$MESH_ADDR:2049 is not reachable from $WHERE. On the manager, the export is bound to the mesh address and ufw must allow it: sudo ufw allow in on tailscale0 to any port 2049 proto tcp"
     return 1
   fi
 
-  local out
-  out="$(host_run "sudo mkdir -p $mnt && sudo mount -t nfs4 -o nfsvers=4,nolock,soft,nosuid,nodev $MESH_ADDR:/monitor-keys $mnt 2>&1" 2>&1)" || {
-    warn "mounting $MESH_ADDR:/monitor-keys failed:"
-    printf '%s\n' "${out:-(no output)}" | tail -3 | sed 's/^/      /' >&2
-    warn "the path is relative to the NFSv4 root, which the export pins to /shared with fsid=0. If this says 'no such file or directory', check that /shared/monitor-keys exists on the manager and that the export admits this node's address."
-    return 1
-  }
+  # One sudo call for the whole probe, and its output goes to a file on the
+  # worker rather than being captured here.
+  #
+  # Both halves of that matter. Over "ssh -t" sudo's password prompt travels on
+  # the same channel as the command's output, so wrapping this in $( ) swallows
+  # the prompt and the run sits forever waiting for a password it never appeared
+  # to ask for. And every extra sudo is another prompt to type, so mount, write
+  # and unmount are one invocation instead of three.
+  #
+  # Exit codes rather than parsed output, so a failure says which step failed:
+  # 10 mount, 11 write, 12 could not even make the mountpoint. The unmount runs
+  # on the way out of every path, so a failed probe never leaves a mount behind.
+  local rc=0
+  host_run "sudo sh -c '
+    mkdir -p $mnt || exit 12
+    if ! mount -t nfs4 -o nfsvers=4,nolock,soft,nosuid,nodev $MESH_ADDR:/monitor-keys $mnt; then
+      rmdir $mnt 2>/dev/null
+      exit 10
+    fi
+    if touch $mnt/.probe-$WORKER_HOSTNAME && rm -f $mnt/.probe-$WORKER_HOSTNAME; then rc=0; else rc=11; fi
+    umount $mnt 2>/dev/null
+    rmdir $mnt 2>/dev/null
+    exit \$rc
+  ' > $log 2>&1" || rc=$?
 
-  local wrote=0
-  host_run "sudo touch $mnt/.probe-$WORKER_HOSTNAME && sudo rm -f $mnt/.probe-$WORKER_HOSTNAME" && wrote=1
-  host_run "sudo umount $mnt && sudo rmdir $mnt" || true
+  if (( rc == 0 )); then
+    host_eval "rm -f $log" >/dev/null 2>&1 || true
+    ok "mounted and wrote to $MESH_ADDR:/monitor-keys over the mesh"
+    return 0
+  fi
 
-  (( wrote )) || { warn "mounted $MESH_ADDR:/monitor-keys but could not write to it"; return 1; }
-  ok "mounted and wrote to $MESH_ADDR:/monitor-keys over the mesh"
+  case "$rc" in
+    10) warn "mounting $MESH_ADDR:/monitor-keys failed:" ;;
+    11) warn "mounted $MESH_ADDR:/monitor-keys but could not write to it:" ;;
+    12) warn "could not create the mountpoint $mnt on $WHERE:" ;;
+    *)  warn "the NFS probe failed (exit $rc):" ;;
+  esac
+  host_eval "cat $log 2>/dev/null" | tail -5 | sed 's/^/      /' >&2
+  host_eval "rm -f $log" >/dev/null 2>&1 || true
+
+  if (( rc == 10 )); then
+    warn "the path is relative to the NFSv4 root, which the export pins to /shared with fsid=0. If this says 'no such file or directory', check that /shared/monitor-keys exists on the manager and that the export admits $WORKER_MESH_ADDR."
+  fi
+  return 1
 }
 
 stage_verify() {
@@ -1014,6 +1063,8 @@ do_uninstall() {
 # overwrites something already set.
 load_env_file "$WORKER_ENV_FILE"
 load_env_file "$ENV_FILE"
+
+warn_if_sudo_prompts
 
 if (( LEAVE || UNINSTALL )); then
   do_uninstall
