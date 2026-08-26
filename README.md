@@ -226,9 +226,16 @@ The certificate and key are found by asking openssl what each file in
 `traefik/secret/` actually is, rather than by extension — CAs hand out `.crt`,
 `.cer` and `.pem` for the same thing, and a `.pem` may be either half. `.pem`
 wins when several parse, matching this repo's convert-before-use convention.
-Before the secrets are created the pair is checked: both PEM, both parseable,
-and the certificate's public key equal to the one the private key derives. A
-mismatched pair otherwise deploys cleanly and fails TLS at runtime.
+DER input is converted rather than rejected: a `.cer` or `.key` the CA issued
+in DER is written beside the original as `*_converted.pem` and used from then
+on, since Traefik reads the secret verbatim and needs PEM.
+
+Before the secrets are created the pair is checked: both parseable, and the
+certificate's public key equal to the one the private key derives. A
+mismatched pair otherwise deploys cleanly and fails TLS at runtime. A leaf
+with no intermediates is flagged — browsers cope, Go clients such as Tailscale
+do not — and the script offers to build the chain by fetching the issuer the
+certificate itself names.
 
 The `mesh` stage joins the node for you: it offers to install Tailscale, mints
 a headscale pre-auth key through the running `<vpn stack>_core` container, and

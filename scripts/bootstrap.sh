@@ -360,7 +360,9 @@ detect_pem() {
     case "$kind" in
       cert)
         openssl x509 -in "$f" -noout >/dev/null 2>&1 || continue
-        n="$(grep -c -- '-----BEGIN CERTIFICATE-----' "$f" 2>/dev/null || echo 1)"
+        n="$(grep -c -- '-----BEGIN CERTIFICATE-----' "$f" 2>/dev/null)" || n=0
+        # DER is binary and has no armour lines, but it parsed, so it holds one.
+        (( n < 1 )) && n=1
         if (( n > bestn )); then best="$f"; bestn="$n"; fi
         ;;
       key)  openssl pkey -in "$f" -noout >/dev/null 2>&1 && { printf '%s' "$f"; return 0; } ;;
@@ -426,6 +428,26 @@ build_fullchain() {
   return 0
 }
 
+# CAs hand out .cer and .key in DER as often as PEM, and Traefik reads the
+# secret verbatim, so anything not PEM-armoured is converted next to the
+# original rather than rejected. The original is left alone.
+to_pem() {
+  local kind="$1" f="$2" out
+  # Tested with a pipe, not a substitution: DER is binary and capturing it
+  # makes bash complain about null bytes.
+  if head -c 11 "$f" 2>/dev/null | grep -q -- '-----BEGIN '; then
+    printf '%s' "$f"; return 0
+  fi
+
+  out="${f%.*}_converted.pem"
+  case "$kind" in
+    cert) openssl x509 -inform DER -in "$f" -out "$out" 2>/dev/null || return 1 ;;
+    key)  openssl pkey -inform DER -in "$f" -out "$out" 2>/dev/null || return 1 ;;
+  esac
+  [[ -s "$out" ]] || return 1
+  printf '%s' "$out"
+}
+
 # A mismatched pair deploys happily and then fails TLS at runtime, so compare
 # the public key the certificate carries against the one the key derives.
 check_cert_pair() {
@@ -434,13 +456,20 @@ check_cert_pair() {
   # Traefik reads the secret verbatim and needs PEM. openssl 3 auto-detects
   # DER, so parsing successfully is not evidence of the right encoding --
   # check the armour.
-  local head
-  head="$(head -c 11 "$CRT_FILE" 2>/dev/null)"
-  [[ "$head" == "-----BEGIN " ]] \
-    || die "$CRT_FILE is not PEM (Traefik needs PEM). If your CA gave you DER: openssl x509 -inform DER -in $CRT_FILE -out ${CRT_FILE%.*}.pem"
-  head="$(head -c 11 "$KEY_FILE" 2>/dev/null)"
-  [[ "$head" == "-----BEGIN " ]] \
-    || die "$KEY_FILE is not PEM (Traefik needs PEM). If your CA gave you DER: openssl pkey -inform DER -in $KEY_FILE -out ${KEY_FILE%.*}.pem"
+  local converted changed=0
+  if converted="$(to_pem cert "$CRT_FILE")" && [[ "$converted" != "$CRT_FILE" ]]; then
+    ok "converted $CRT_FILE to PEM as $converted"
+    CRT_FILE="$converted"; changed=1
+  elif [[ -z "${converted:-}" ]]; then
+    die "$CRT_FILE is neither PEM nor DER; is it really a certificate?"
+  fi
+  if converted="$(to_pem key "$KEY_FILE")" && [[ "$converted" != "$KEY_FILE" ]]; then
+    ok "converted $KEY_FILE to PEM as $converted"
+    KEY_FILE="$converted"; changed=1
+  elif [[ -z "${converted:-}" ]]; then
+    die "$KEY_FILE is neither PEM nor DER; is it really a private key?"
+  fi
+  (( changed )) && write_env
 
   openssl x509 -in "$CRT_FILE" -noout >/dev/null 2>&1 \
     || die "$CRT_FILE does not parse as a certificate"
