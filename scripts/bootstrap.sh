@@ -617,15 +617,38 @@ ensure_nfs_kernel() {
 }
 
 ensure_swarm() {
-  swarm_active && { skip "swarm already initialised"; return; }
+  local advertise="$SWARM_ADVERTISE_ADDR"
+
+  if swarm_active; then
+    skip "swarm already initialised"
+    # The advertise address is chosen at init and cannot be changed after, so
+    # a swarm that came up before the mesh existed is advertising a public
+    # address -- and every worker will join, and carry overlay traffic, over
+    # the internet rather than the mesh.
+    local node_addr
+    node_addr="$(docker info --format '{{.Swarm.NodeAddr}}' 2>/dev/null)" || node_addr=""
+    if [[ -n "$node_addr" && "$node_addr" != "$MESH_ADDR" ]]; then
+      warn "the swarm advertises $node_addr, not $MESH_ADDR: workers will join over that address instead of the mesh. Changing it means re-initialising the swarm -- see 'Moving the swarm onto the mesh' in the README."
+    fi
+    return
+  fi
 
   may_fix "The target is not in a swarm. Initialise one?" \
     || { blocker "the target is not in a swarm. Run 'docker swarm init' on it, or re-run with --with-host-setup."; return; }
 
-  if [[ -n "$SWARM_ADVERTISE_ADDR" ]]; then
-    host_run "docker swarm init --advertise-addr $SWARM_ADVERTISE_ADDR"
+  # Prefer the mesh address when the host already holds it. On a first run it
+  # will not -- the mesh needs headscale, which needs traefik, which needs the
+  # swarm -- so say what that costs rather than quietly using the public one.
+  if [[ -z "$advertise" ]] && host_eval "ip -4 -oneline addr show 2>/dev/null | grep -qw $MESH_ADDR"; then
+    advertise="$MESH_ADDR"
+  fi
+
+  if [[ -n "$advertise" ]]; then
+    host_run "docker swarm init --advertise-addr $advertise"
+    ok "swarm advertising $advertise"
   else
     host_run 'docker swarm init'
+    warn "this host does not hold $MESH_ADDR yet, so the swarm advertises whatever docker chose -- usually the public address. Workers would join over it. Once the mesh is up, re-initialise to move the swarm onto it (README: Moving the swarm onto the mesh), or set SWARM_ADVERTISE_ADDR."
   fi
   record "swarm_init"
 }

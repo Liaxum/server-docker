@@ -142,6 +142,38 @@ The connection is checked once up front, so an unreachable host fails as a
 connection error instead of surfacing as a missing package or an absent
 directory in every later check. `sudo` gets a terminal, so it can prompt.
 
+### Moving the swarm onto the mesh
+
+Docker fixes a manager's advertise address at `docker swarm init` and there is
+no way to change it afterwards. The bootstrap order makes that awkward: the
+swarm has to exist before Traefik, which has to exist before headscale, which
+is what hands out the mesh address — so on a first run the node does not hold
+`MESH_ADDR` yet and Docker advertises whatever interface it picks, usually the
+public one.
+
+The consequence is not cosmetic. `docker swarm join-token worker` then prints
+a public address, workers join over it, and the overlay carries their traffic
+over the internet rather than the mesh.
+
+The `host` stage uses `MESH_ADDR` when the node already holds it, so a rebuild
+of an already-meshed host gets this right on its own. To correct a swarm that
+came up before the mesh, re-initialise it:
+
+```bash
+# on the manager, once it holds MESH_ADDR
+docker swarm leave --force
+docker swarm init --advertise-addr 100.64.0.1
+./scripts/bootstrap.sh --ssh <target> --from swarm
+```
+
+Leaving the swarm destroys services, secrets and config objects — the script
+recreates all of them — but **not** volumes, so the Komodo database, the keys
+and the shared files survive. Any worker already joined must re-join with the
+new token.
+
+`SWARM_ADVERTISE_ADDR` overrides the choice if the address you want is neither
+of those.
+
 ### Starting over, and removing it
 
 ```bash
