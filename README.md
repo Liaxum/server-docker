@@ -174,10 +174,29 @@ shared files survive. Any worker already joined has to re-join with the new
 token. This one prompt defaults to **no**, unlike the other host prompts,
 because it throws away the running cluster to rebuild it.
 
-When the node does not hold the address yet — which is every first run, since
-the mesh needs headscale, which needs Traefik, which needs the swarm — there
-is nothing to offer, so the stage says what was advertised instead and what
-that costs. Re-run it once the mesh is up.
+A first run cannot advertise the mesh address at all: the swarm has to exist
+before Traefik, which comes before headscale, which is what hands the address
+out. So the `host` stage lets Docker choose, and says so.
+
+The `mesh` stage then closes the loop. The moment after the node joins is the
+first time it holds the address, so the stage moves the swarm onto it and
+rebuilds what that destroys — swarm resources, Traefik and headscale, in that
+order. A plain run therefore ends with the swarm on the mesh without anyone
+having to notice:
+
+```
+  ok joined the mesh as 100.64.0.1
+==> moving the swarm onto 100.64.0.1
+    Re-initialise the swarm to advertise 100.64.0.1? [Y/n]:
+  ok swarm re-initialised, advertising 100.64.0.1
+==> swarm resources
+==> traefik
+==> headscale
+```
+
+Volumes and `/opt/vpn/data` are untouched, so headscale keeps its database and
+this node stays registered. Any worker already joined has to re-join with the
+new token.
 
 ### Starting over, and removing it
 

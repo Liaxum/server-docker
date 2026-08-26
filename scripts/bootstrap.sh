@@ -644,7 +644,7 @@ the komodo database, the keys and the shared files survive. Any worker already
 joined has to re-join with the new token.
 
 EOF
-  confirm "Re-initialise the swarm to advertise $want?" no || return 1
+  confirm "Re-initialise the swarm to advertise $want?" "${3:-no}" || return 1
 
   host_run 'docker swarm leave --force'
   host_run "docker swarm init --advertise-addr $want"
@@ -1162,6 +1162,28 @@ EOF
   done
 }
 
+# The swarm has to be initialised before traefik, which comes before
+# headscale, which is what hands out the mesh address -- so a first run cannot
+# advertise it. Immediately after the join is the first moment the host holds
+# it, so move the swarm then and rebuild what that destroys.
+align_swarm_advertise() {
+  local want="$MESH_ADDR" have
+  [[ -n "${SWARM_ADVERTISE_ADDR:-}" ]] && want="$SWARM_ADVERTISE_ADDR"
+  [[ -n "$want" ]] || return 0
+
+  have="$(docker info --format '{{.Swarm.NodeAddr}}' 2>/dev/null)" || have=""
+  [[ -n "$have" && "$have" != "$want" ]] || return 0
+  host_eval "ip -4 -oneline addr show 2>/dev/null | grep -qw $want" || return 0
+
+  info "moving the swarm onto $want"
+  reinit_swarm "$want" "$have" yes || { warn "left as it is: the swarm still advertises $have"; return 0; }
+
+  # leave --force took the network, secrets, configs and services with it.
+  stage_swarm
+  stage_traefik
+  stage_vpn
+}
+
 stage_mesh() {
   info "mesh address"
 
@@ -1177,6 +1199,7 @@ stage_mesh() {
 
   if mesh_addr_held; then
     ok "$MESH_ADDR is assigned to ${SSH_TARGET:-this host}"
+    align_swarm_advertise
     return
   fi
 
@@ -1185,6 +1208,7 @@ stage_mesh() {
   if join_mesh; then
     if [[ "$JOINED_ADDR" == "$MESH_ADDR" ]]; then
       ok "joined the mesh as $MESH_ADDR"
+      align_swarm_advertise
       return
     fi
     # headscale allocates in order, so the address is not ours to choose.
@@ -1193,6 +1217,7 @@ stage_mesh() {
 
   if wait_for_mesh; then
     ok "$MESH_ADDR is assigned to ${SSH_TARGET:-this host}"
+    align_swarm_advertise
     return
   fi
   blocker "not joined to the mesh"
