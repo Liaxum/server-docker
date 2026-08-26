@@ -145,9 +145,11 @@ directory in every later check. `sudo` gets a terminal, so it can prompt.
 ### Starting over, and removing it
 
 ```bash
-./scripts/bootstrap.sh --reset-config              # forget the answers
-./scripts/bootstrap.sh --uninstall                 # remove the stacks and objects
-./scripts/bootstrap.sh --uninstall --with-data     # and the volumes
+./scripts/bootstrap.sh --reset-config               # forget the answers
+./scripts/bootstrap.sh --uninstall                  # stacks, objects, images
+./scripts/bootstrap.sh --uninstall --with-data      # and the volumes
+./scripts/bootstrap.sh --uninstall --with-host      # and the host changes
+./scripts/bootstrap.sh --uninstall --keep-images    # leave the images alone
 ```
 
 `--reset-config` deletes `bootstrap.env` and the rendered vpn configs and
@@ -155,8 +157,8 @@ touches nothing else, so the next run asks afresh and redeploys over whatever
 is running.
 
 `--uninstall` removes the four stacks, the standalone NFS compose project,
-`web-net`, the TLS secrets, the config objects, and finally `bootstrap.env`
-and the rendered vpn configs — last, because everything before it needs those
+`web-net`, the TLS secrets, the config objects, the images these stacks name,
+and finally `bootstrap.env` and the rendered vpn configs — last, because everything before it needs those
 settings to know what to remove. It prints what it found
 before doing anything and asks you to type the manager hostname; without a
 terminal to ask on, it refuses. Volumes are kept unless `--with-data` is

@@ -50,6 +50,7 @@ RESET_CONFIG=0
 UNINSTALL=0
 WITH_DATA=0
 WITH_HOST=0
+KEEP_IMAGES=0
 DRY_RUN=0
 FROM_STAGE=""
 ONLY_STAGE=""
@@ -98,6 +99,7 @@ while (( $# )); do
     --uninstall)       UNINSTALL=1 ;;
     --with-data)       WITH_DATA=1 ;;
     --with-host)       WITH_HOST=1 ;;
+    --keep-images)     KEEP_IMAGES=1 ;;
     --ssh)             SSH_TARGET="${2:?--ssh needs user@host}"; shift ;;
     --dry-run)         DRY_RUN=1 ;;
     --from)            FROM_STAGE="${2:?--from needs a stage}"; shift ;;
@@ -1159,6 +1161,18 @@ do_reset_config() {
   return 0
 }
 
+# The images these stacks name, read from the compose files so the list stays
+# right as the stacks change. Docker refuses to remove one another container
+# still needs, which is the check we want.
+stack_images() {
+  local f
+  for f in traefik/compose.yml apps/vpn/compose.yml apps/nfs/compose.yml \
+           apps/filebrowser/compose.yml apps/monitor/compose.yml; do
+    [[ -f "$f" ]] || continue
+    docker compose -f "$f" config --images 2>/dev/null || true
+  done | sort -u
+}
+
 # Undo the host changes this script recorded making, newest concern first.
 # Nothing that was already present when we arrived was recorded, so nothing
 # that predates the bootstrap is touched.
@@ -1236,6 +1250,11 @@ do_uninstall() {
   printf '    secrets: liaxum_crt liaxum_key\n'
   printf '    configs: traefik_dynamic, and the vpn config objects\n'
   printf '    local:   %s and the rendered vpn configs\n' "$ENV_FILE"
+  if (( KEEP_IMAGES )); then
+    printf '    images:  kept\n'
+  else
+    printf '    images:  the ones these stacks name (--keep-images to keep them)\n'
+  fi
   if (( WITH_HOST )); then
     printf '    %shost:    packages, swarm membership, tailscale and the hostname this script changed%s\n' "$RED" "$OFF"
   else
@@ -1292,6 +1311,16 @@ do_uninstall() {
       docker volume inspect "$v" >/dev/null 2>&1 && run docker volume rm "$v"
     done
     warn "volumes on other nodes are not reachable from here; remove ${MONITOR_STACK}_keys on each worker"
+  fi
+
+  if (( ! KEEP_IMAGES )); then
+    local img
+    while read -r img; do
+      [[ -n "$img" ]] || continue
+      # Left in place when something else still needs it: docker says so and
+      # the failure is not ours to force.
+      run docker image rm "$img" 2>/dev/null || skip "$img is still in use, or already gone"
+    done < <(stack_images)
   fi
 
   (( WITH_HOST )) && undo_host
