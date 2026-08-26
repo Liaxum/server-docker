@@ -728,6 +728,17 @@ deploy() {
 }
 
 stage_traefik()     { info "traefik";     deploy traefik/compose.yml "$TRAEFIK_STACK"; }
+# The generated admin password, read back out of the service log. Works in any
+# invocation, so the summary can show it even when the filebrowser stage ran
+# in an earlier run.
+filebrowser_password() {
+  local line
+  line="$(docker service logs "${FILES_STACK}_core" 2>&1 | grep -i 'password' | tail -1)" || true
+  [[ -n "$line" ]] || return 1
+  # The value follows the last ": " -- timestamps have no space after theirs.
+  printf '%s' "${line##*: }"
+}
+
 stage_filebrowser() {
   info "filebrowser"
   deploy apps/filebrowser/compose.yml "$FILES_STACK"
@@ -736,19 +747,15 @@ stage_filebrowser() {
   # Filebrowser prints a generated admin password once, when it creates its
   # database. Telling the operator to go and grep for it is the same mistake
   # as hiding the headplane key, so read it out here.
-  local line attempt=0
+  local pw attempt=0
   while (( attempt < 6 )); do
-    line="$(docker service logs "${FILES_STACK}_core" 2>&1 | grep -i 'password' | tail -1)" || true
-    [[ -n "$line" ]] && break
+    pw="$(filebrowser_password)" && break
     attempt=$((attempt + 1))
     sleep 3
   done
 
-  if [[ -n "${line:-}" ]]; then
-    printf '\n    %sfilebrowser -- sign in at https://%s.%s%s\n' \
-      "$BOLD" "$FILES_SUBDOMAIN" "$DOMAIN" "$OFF"
-    printf '    user: admin\n'
-    printf '    %s\n\n' "$line"
+  if [[ -n "${pw:-}" ]]; then
+    ok "filebrowser admin password: $pw"
   else
     skip "no generated password in the log: its database already existed, so an earlier password still applies"
   fi
@@ -1150,14 +1157,18 @@ stage_verify() {
 
   (( failed )) && die "some services are not healthy (see above)"
 
+  local FILES_PASSWORD
+  FILES_PASSWORD="$(filebrowser_password)" || FILES_PASSWORD=""
+
   cat <<EOF
 
 $(printf '%s' "$GREEN")All services are up.$(printf '%s' "$OFF")
 
   headscale   https://$VPN_SUBDOMAIN.$DOMAIN
   headplane   https://$VPN_SUBDOMAIN.$DOMAIN/admin
-              sign in with: ${HEADPLANE_API_KEY:-<none; re-run the vpn stage>}
-  filebrowser https://$FILES_SUBDOMAIN.$DOMAIN     password: docker service logs ${FILES_STACK}_core
+              API key: ${HEADPLANE_API_KEY:-<none; re-run the vpn stage>}
+  filebrowser https://$FILES_SUBDOMAIN.$DOMAIN
+              admin / ${FILES_PASSWORD:-<set earlier; docker service logs ${FILES_STACK}_core>}
   komodo      https://$MONITOR_SUBDOMAIN.$DOMAIN
 
 EOF
