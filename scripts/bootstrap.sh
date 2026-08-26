@@ -278,6 +278,7 @@ MONITOR_STACK=$MONITOR_STACK
 MONITOR_SUBDOMAIN=$MONITOR_SUBDOMAIN
 MCP_SUBDOMAIN=$MCP_SUBDOMAIN
 MESH_USER=$MESH_USER
+SWARM_ADVERTISE_ADDR=$SWARM_ADVERTISE_ADDR
 KOMODO_ONBOARDING_KEY=$KOMODO_ONBOARDING_KEY
 CRT_FILE=$CRT_FILE
 KEY_FILE=$KEY_FILE
@@ -320,6 +321,10 @@ stage_config() {
 
   ask CRT_FILE "TLS certificate file" "$(detect_pem cert || echo "$CERT_DIR/certificate.pem")"
   ask KEY_FILE "TLS private key file" "$(detect_pem key  || echo "$CERT_DIR/private.key")"
+
+  # What workers connect to. The mesh address is the point of the mesh, but
+  # docker will only advertise an address the host already holds.
+  ask SWARM_ADVERTISE_ADDR "Address the swarm advertises to workers" "$MESH_ADDR"
 
   ask MESH_USER "Headscale user to enrol nodes under" "admin"
   [[ "$MESH_USER" =~ ^[A-Za-z0-9._-]+$ ]] || die "MESH_USER '$MESH_USER' is not a valid name"
@@ -616,19 +621,60 @@ ensure_nfs_kernel() {
   record "loaded_nfs_modules"
 }
 
+# Re-initialise so the swarm advertises $1. Destroys services, secrets and
+# config objects -- the later stages rebuild all of them -- and keeps volumes,
+# so the databases, keys and shared files survive.
+reinit_swarm() {
+  local want="$1" have="$2"
+
+  if [[ ! -t 0 ]]; then
+    warn "the swarm advertises $have, not $want, and there is no terminal to confirm a re-initialisation on. Run this interactively, or see 'Moving the swarm onto the mesh' in the README."
+    return 1
+  fi
+
+  cat >&2 <<EOF
+
+The swarm advertises $have. Workers join over that address and the overlay
+carries their traffic there, so it will not use the mesh.
+
+Docker fixes this at init and cannot change it, so moving it to $want means
+leaving the swarm and initialising again. That destroys services, secrets and
+config objects -- the stages after this rebuild them -- and keeps volumes, so
+the komodo database, the keys and the shared files survive. Any worker already
+joined has to re-join with the new token.
+
+EOF
+  confirm "Re-initialise the swarm to advertise $want?" no || return 1
+
+  host_run 'docker swarm leave --force'
+  host_run "docker swarm init --advertise-addr $want"
+  ok "swarm re-initialised, advertising $want"
+  return 0
+}
+
 ensure_swarm() {
-  local advertise="$SWARM_ADVERTISE_ADDR"
+  # Separate statements: a later name in one "local" cannot read an earlier
+  # one on the same line, and set -u turns that into an unbound variable.
+  local wanted want have=""
+  wanted="${SWARM_ADVERTISE_ADDR:-$MESH_ADDR}"
+  want="$wanted"
+
+  # docker refuses to advertise an address the host does not hold.
+  if [[ -n "$want" ]] && ! host_eval "ip -4 -oneline addr show 2>/dev/null | grep -qw $want"; then
+    want=""
+  fi
 
   if swarm_active; then
-    skip "swarm already initialised"
-    # The advertise address is chosen at init and cannot be changed after, so
-    # a swarm that came up before the mesh existed is advertising a public
-    # address -- and every worker will join, and carry overlay traffic, over
-    # the internet rather than the mesh.
-    local node_addr
-    node_addr="$(docker info --format '{{.Swarm.NodeAddr}}' 2>/dev/null)" || node_addr=""
-    if [[ -n "$node_addr" && "$node_addr" != "$MESH_ADDR" ]]; then
-      warn "the swarm advertises $node_addr, not $MESH_ADDR: workers will join over that address instead of the mesh. Changing it means re-initialising the swarm -- see 'Moving the swarm onto the mesh' in the README."
+    have="$(docker info --format '{{.Swarm.NodeAddr}}' 2>/dev/null)" || have=""
+
+    if [[ -n "$want" && -n "$have" && "$have" != "$want" ]]; then
+      reinit_swarm "$want" "$have" || warn "left as it is: the swarm still advertises $have"
+      return
+    fi
+
+    skip "swarm already initialised${have:+, advertising $have}"
+    if [[ -z "$want" && -n "$have" && -n "$wanted" && "$have" != "$wanted" ]]; then
+      warn "it advertises $have rather than $wanted, which this host does not hold yet. Once it does, re-run this stage and it will offer to move the swarm onto it."
     fi
     return
   fi
@@ -636,19 +682,12 @@ ensure_swarm() {
   may_fix "The target is not in a swarm. Initialise one?" \
     || { blocker "the target is not in a swarm. Run 'docker swarm init' on it, or re-run with --with-host-setup."; return; }
 
-  # Prefer the mesh address when the host already holds it. On a first run it
-  # will not -- the mesh needs headscale, which needs traefik, which needs the
-  # swarm -- so say what that costs rather than quietly using the public one.
-  if [[ -z "$advertise" ]] && host_eval "ip -4 -oneline addr show 2>/dev/null | grep -qw $MESH_ADDR"; then
-    advertise="$MESH_ADDR"
-  fi
-
-  if [[ -n "$advertise" ]]; then
-    host_run "docker swarm init --advertise-addr $advertise"
-    ok "swarm advertising $advertise"
+  if [[ -n "$want" ]]; then
+    host_run "docker swarm init --advertise-addr $want"
+    ok "swarm advertising $want"
   else
     host_run 'docker swarm init'
-    warn "this host does not hold $MESH_ADDR yet, so the swarm advertises whatever docker chose -- usually the public address. Workers would join over it. Once the mesh is up, re-initialise to move the swarm onto it (README: Moving the swarm onto the mesh), or set SWARM_ADVERTISE_ADDR."
+    warn "this host does not hold $wanted yet, so the swarm advertises whatever docker chose -- usually the public address. Workers would join over it. Re-run this stage once the mesh is up and it will offer to move the swarm onto it."
   fi
   record "swarm_init"
 }

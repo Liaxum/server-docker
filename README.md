@@ -155,24 +155,29 @@ The consequence is not cosmetic. `docker swarm join-token worker` then prints
 a public address, workers join over it, and the overlay carries their traffic
 over the internet rather than the mesh.
 
-The `host` stage uses `MESH_ADDR` when the node already holds it, so a rebuild
-of an already-meshed host gets this right on its own. To correct a swarm that
-came up before the mesh, re-initialise it:
+`SWARM_ADVERTISE_ADDR` is asked for in the config stage and defaults to
+`MESH_ADDR`. The `host` stage uses it when the node holds that address, and
+when the node is already in a swarm advertising something else, it offers to
+move it:
 
-```bash
-# on the manager, once it holds MESH_ADDR
-docker swarm leave --force
-docker swarm init --advertise-addr 100.64.0.1
-./scripts/bootstrap.sh --ssh <target> --from swarm
+```
+The swarm advertises 203.0.113.10. Workers join over that address and the
+overlay carries their traffic there, so it will not use the mesh.
+...
+    Re-initialise the swarm to advertise 100.64.0.1? [y/N]:
 ```
 
-Leaving the swarm destroys services, secrets and config objects — the script
-recreates all of them — but **not** volumes, so the Komodo database, the keys
-and the shared files survive. Any worker already joined must re-join with the
-new token.
+Saying yes runs `docker swarm leave --force` and re-initialises on the address
+you chose; the stages after it rebuild the services, secrets and config
+objects. Volumes are untouched, so the Komodo database, the keys and the
+shared files survive. Any worker already joined has to re-join with the new
+token. This one prompt defaults to **no**, unlike the other host prompts,
+because it throws away the running cluster to rebuild it.
 
-`SWARM_ADVERTISE_ADDR` overrides the choice if the address you want is neither
-of those.
+When the node does not hold the address yet — which is every first run, since
+the mesh needs headscale, which needs Traefik, which needs the swarm — there
+is nothing to offer, so the stage says what was advertised instead and what
+that costs. Re-run it once the mesh is up.
 
 ### Starting over, and removing it
 
