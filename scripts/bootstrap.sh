@@ -1075,7 +1075,10 @@ stage_verify() {
   # Services are still converging when this runs -- it is called seconds after
   # the deploys -- so retry before calling anything unhealthy. Reporting a
   # restart in progress as a failure sends people to inspect a healthy service.
-  while (( pending && attempt < 12 )); do
+  # Pulling an image on a cold host is the slow part; VERIFY_WAIT is in
+  # seconds and can be raised for a slow link.
+  local tries=$(( ${VERIFY_WAIT:-180} / 5 ))
+  while (( pending && attempt < tries )); do
     pending=0
     for svc in "${TRAEFIK_STACK}_core" "${VPN_STACK}_core" "${VPN_STACK}_web" \
                "${FILES_STACK}_core" "${MONITOR_STACK}_db" "${MONITOR_STACK}_core" \
@@ -1087,7 +1090,7 @@ stage_verify() {
     done
     (( pending )) || break
     attempt=$((attempt + 1))
-    (( attempt == 1 )) && printf '    waiting for services to converge' >&2
+    (( attempt == 1 )) && printf '    waiting up to %ss for services to converge' "${VERIFY_WAIT:-180}" >&2
     printf '.' >&2
     sleep 5
   done

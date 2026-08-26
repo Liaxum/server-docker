@@ -254,7 +254,12 @@ created from `traefik/secret/` (override with `CRT_FILE`/`KEY_FILE`), and
 because Docker secrets are immutable, rotating one means removing the secret
 and redeploying Traefik by hand. and rotating one means removing the secret and redeploying Traefik by hand.
 
-The stages are `host swarm traefik vpn mesh nfs filebrowser monitor verify`.
+The stages are `config host swarm traefik vpn mesh nfs filebrowser monitor
+verify`.
+
+`verify` waits up to `VERIFY_WAIT` seconds (180 by default) for services to
+converge before reporting anything unhealthy — pulling images on a cold host
+is the slow part, and a service still starting is not a broken one.
 
 ## Bring-up order
 
