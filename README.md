@@ -423,22 +423,56 @@ rather than warned about.
 
 Membership in `docker node ls` does not mean the node can do its job. The
 Komodo agent mounts the shared keys over NFS, and Docker reports a failed
-volume mount as a scheduling problem — so `verify` mounts
-`100.64.0.1:/monitor-keys` itself, writes a file, removes it and unmounts:
+volume mount as a scheduling problem, so neither tells you much on its own.
+
+`verify` checks both, in this order:
 
 ```
-  ok mesh address: 100.64.0.5
+  ok mesh address: 100.64.0.4
   ok swarm: active
+  ok the manager advertises 100.64.0.1
+  ok docker node ls: liaxum-mini Ready Active
+  ok monitor_agent on this node: Running 5 minutes ago -- it mounts the keys over NFS, so the mount works
   ok mounted and wrote to 100.64.0.1:/monitor-keys over the mesh
-  ok docker node ls: gamingpc Ready Active
-  ok monitor_agent on this node: Running 40 seconds ago
 ```
 
-If port 2049 is unreachable it names the rule to add on the manager
-(`ufw allow in on tailscale0 to any port 2049 proto tcp`), and if the mount is
-refused it points at the `fsid=0` root rather than leaving you to guess.
+The agent line comes before the probe deliberately. Docker mounts an NFS
+volume *before* starting the container, so a task that reached `Running`
+**is** the mount succeeding — stronger evidence than the probe, which only
+shows this script can mount it too. So when the probe cannot run (see below)
+but the agent is Running, the node is reported ready rather than failed.
 
-The last two lines need `--manager`; without it they are skipped with a note.
+The probe itself mounts `100.64.0.1:/monitor-keys`, writes a file, removes it
+and unmounts. If port 2049 is unreachable it names the rule to add on the
+manager (`ufw allow in on tailscale0 to any port 2049 proto tcp`); if the
+mount is refused it points at the `fsid=0` root rather than leaving you to
+guess.
+
+The `docker node ls` and agent lines need `--manager`; without it they are
+skipped with a note, and a probe that cannot run then has nothing to fall back
+on and does fail.
+
+### sudo and the probe
+
+Mounting needs root, so on a worker whose ssh user is not root and whose sudo
+wants a password, the probe prompts:
+
+```
+[sudo: authenticate] Password:
+```
+
+Answer it and the probe runs. Decline and, with the agent Running, you still
+get `worker ready` — the probe reports that it could not run and says plainly
+that this is not evidence about the mount either way.
+
+The prompt has to reach your terminal, which means the probe runs in one ssh
+connection with nothing captured, and reports through its exit code alone.
+That is not incidental: capturing the command swallows the prompt and hangs,
+redirecting around sudo puts the prompt in the log instead, pre-creating that
+log fails because root cannot `O_CREAT` a file the ssh user owns in a sticky
+`/tmp` under `fs.protected_regular`, and authenticating in one connection then
+probing in another fails because sudo's credential cache is per-tty. Passwordless
+sudo, or an ssh user that is already root, avoids the prompt entirely.
 
 ### Settings
 
