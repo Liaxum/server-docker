@@ -138,7 +138,7 @@ warn_if_sudo_prompts() {
   (( DRY_RUN )) && return 0
   host_eval 'sudo -n true' >/dev/null 2>&1 && return 0
   host_eval 'test "$(id -u)" = 0' >/dev/null 2>&1 && return 0
-  warn "sudo on $WHERE asks for a password, so this run will prompt for it several times, between steps. A wrong one makes that step fail on its own -- re-running is safe."
+  warn "sudo on $WHERE asks for a password, so this run will prompt for it between steps. A wrong one makes that step fail on its own -- re-running is safe. Passwordless sudo, or an ssh user that is already root, avoids the prompts entirely."
 }
 
 # --------------------------------------------------------------- helpers ---
@@ -740,33 +740,27 @@ verify_nfs() {
     return 1
   fi
 
-  # Authenticate first, separately, and never capture that step. Two earlier
-  # attempts to have one command both prompt and report failed for opposite
-  # reasons: capturing it swallowed the prompt and hung, and writing the output
-  # to a file instead broke on the file's ownership -- the ssh user creates it,
-  # root cannot then open it with O_CREAT in a sticky world-writable /tmp when
-  # fs.protected_regular is on, which is the default. There is no arrangement
-  # where one command safely does both, so it is two.
+  # One ssh connection, nothing captured, and the result carried by the exit
+  # code alone. That last part is what makes the rest work.
   #
-  # sudo -v prompts on the terminal, where it can be answered, and caches the
-  # credential for the probe that follows.
-  if ! host_run "sudo -n true 2>/dev/null || sudo -v"; then
-    warn "the probe could not run: sudo on $WHERE did not authenticate (see its message above)."
-    warn "that says nothing about the mount either way. Re-run '--only verify' and answer the prompt, or check by hand on $WHERE: sudo mount -t nfs4 $MESH_ADDR:/monitor-keys /mnt"
-    return 2
-  fi
-
-  # Now the credential is cached, so this cannot prompt and is safe to capture.
-  # -n guarantees it: if the cache expired between the two steps it fails
-  # immediately rather than waiting on a prompt nobody can see. host_eval
-  # rather than host_run, since no pty is wanted around captured output.
+  # Four arrangements failed before this one, all for the same underlying
+  # reason -- sudo needs a terminal to prompt on, and capturing output takes it
+  # away. Capturing the command swallowed the prompt and hung. Redirecting
+  # around sudo put the prompt in the log instead of on the terminal.
+  # Pre-creating that log broke on ownership, since root cannot O_CREAT a file
+  # the ssh user owns in a sticky /tmp when fs.protected_regular is on. And
+  # authenticating in one connection then running the probe in another failed
+  # because sudo's credential cache is per-tty by default, so the second
+  # connection is not covered by the first.
   #
-  # Exit codes rather than parsed output, so a failure names the step that
-  # failed: 10 mount, 11 write, 12 could not even make the mountpoint. The
-  # unmount runs on the way out of every path, so a failed probe never leaves a
-  # mount or a stray directory behind.
-  local out rc=0
-  out="$(host_eval "sudo -n sh -c '
+  # There is nothing to capture. Whatever sudo and mount have to say goes to
+  # the terminal, where it is readable as it happens, and the exit code says
+  # which step failed: 10 mount, 11 write, 12 mountpoint, 1 sudo itself. The
+  # inner script never returns 1 of its own accord, so that value is
+  # unambiguous. Every path unmounts and removes the mountpoint on the way out,
+  # so a failed probe leaves nothing behind.
+  local rc=0
+  host_run "sudo sh -c '
     mkdir -p $mnt || exit 12
     if ! mount -t nfs4 -o nfsvers=4,nolock,soft,nosuid,nodev $MESH_ADDR:/monitor-keys $mnt; then
       rmdir $mnt 2>/dev/null
@@ -776,28 +770,23 @@ verify_nfs() {
     umount $mnt 2>/dev/null
     rmdir $mnt 2>/dev/null
     exit \$rc
-  ' 2>&1")" || rc=$?
-
-  if (( rc == 0 )); then
-    ok "mounted and wrote to $MESH_ADDR:/monitor-keys over the mesh"
-    return 0
-  fi
+  '" || rc=$?
 
   case "$rc" in
-    10) warn "mounting $MESH_ADDR:/monitor-keys failed:" ;;
-    11) warn "mounted $MESH_ADDR:/monitor-keys but could not write to it:" ;;
-    12) warn "could not create the mountpoint $mnt on $WHERE:" ;;
-    1)  warn "the probe could not run: sudo on $WHERE would not run without prompting."
-        warn "that says nothing about the mount either way."
+    0)  ok "mounted and wrote to $MESH_ADDR:/monitor-keys over the mesh"; return 0 ;;
+    10) warn "mounting $MESH_ADDR:/monitor-keys failed -- see the mount error above."
+        warn "the path is relative to the NFSv4 root, which the export pins to /shared with fsid=0. If it says 'no such file or directory', check that /shared/monitor-keys exists on the manager and that the export admits $WORKER_MESH_ADDR."
+        return 1 ;;
+    11) warn "mounted $MESH_ADDR:/monitor-keys but could not write to it -- see the error above."
+        return 1 ;;
+    12) warn "could not create the mountpoint $mnt on $WHERE -- see the error above."
+        return 1 ;;
+    1)  warn "the probe could not run: sudo on $WHERE did not authenticate."
+        warn "that says nothing about the mount either way. Re-run '--only verify' and answer the prompt, or check by hand on $WHERE: sudo mount -t nfs4 $MESH_ADDR:/monitor-keys /mnt"
         return 2 ;;
-    *)  warn "the NFS probe failed (exit $rc):" ;;
+    *)  warn "the NFS probe failed (exit $rc) -- see the output above."
+        return 1 ;;
   esac
-  printf '%s\n' "${out:-(no output)}" | tail -5 | sed 's/^/      /' >&2
-
-  if (( rc == 10 )); then
-    warn "the path is relative to the NFSv4 root, which the export pins to /shared with fsid=0. If this says 'no such file or directory', check that /shared/monitor-keys exists on the manager and that the export admits $WORKER_MESH_ADDR."
-  fi
-  return 1
 }
 
 stage_verify() {
