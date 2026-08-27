@@ -1,12 +1,29 @@
-version: '3.8'
-
+# docker stack deploy -c apps/pihole/compose.yml pihole
+#
+# Network-wide DNS for the mesh, pinned to the VPS.
+#
+# BEFORE FIRST DEPLOY, read "Pi-hole and port 53" in the README. Swarm cannot
+# bind a published port to one address, so this listens on 53 on EVERY
+# interface of the manager -- the public one included. An open resolver on a
+# public IP is found by scanners within hours and used for DNS amplification,
+# which is the kind of thing hosting providers null-route a server for. The
+# firewall rules in the README are not optional hardening; without them this
+# service should not be deployed.
 services:
   core:
     image: pihole/pihole:latest
     networks:
       - web-net
-    
-    # We bypass the Swarm routing mesh for DNS so Pi-hole can see real client IPs!
+
+    # Host mode, not the swarm routing mesh: the mesh source-NATs every query
+    # to the ingress network's address, so Pi-hole would attribute all traffic
+    # to one client and per-client stats and rules would be meaningless.
+    #
+    # Swarm's long port syntax has no host_ip field -- it is documented as
+    # unsupported in swarm -- so this binds 0.0.0.0:53 and cannot be narrowed
+    # here. apps/nfs/compose.yml solves the same problem by not being a swarm
+    # stack at all, which is not an option for a service that needs Traefik's
+    # swarm provider to route its web UI. Hence the firewall.
     ports:
       - target: 53
         published: 53
@@ -16,36 +33,67 @@ services:
         published: 53
         protocol: udp
         mode: host
-        
+
     environment:
-      - TZ=Europe/Paris  # Sets the correct timezone for your logs
-      - FTLCONF_webserver_api_password=ROSeng7i  # Change this!
-      
-      # Optional: Helps prevent DNS loops
-      - FTLCONF_LOCAL_IPV4=10.0.0.1  # Change to the VPN/Local IP of the Mac Mini
-      
+      - TZ=Europe/Paris
+
+      # Change this before deploying, and treat the value below as burned: an
+      # earlier one was committed to this repo and is in the git history.
+      - FTLCONF_webserver_api_password=CHANGE_ME
+
+      # Stated rather than left to the image default, and matched to the
+      # nameservers headscale hands out in apps/vpn/config.yaml.template so
+      # mesh clients get the same answers whichever resolver they reach.
+      # v6 syntax: semicolon separated.
+      - FTLCONF_dns_upstreams=1.1.1.1;8.8.8.8
+
+      # Stated explicitly because the default does not suit this topology.
+      # Pi-hole's other listening modes decide "local" from its own interface
+      # addresses, and this container only ever sees the overlay (10.x) and
+      # the gwbridge (172.x) -- so a mesh client at 100.64.0.4 looks foreign
+      # and its queries would be refused. ALL is what makes mesh clients work.
+      #
+      # The cost is that nothing inside Pi-hole limits who may query it, so
+      # the firewall rules in the README are the only thing standing between
+      # this and an open resolver. Do not deploy without them.
+      - FTLCONF_dns_listeningMode=ALL
+
     volumes:
       - pihole-etc:/etc/pihole
       - pihole-dnsmasq:/etc/dnsmasq.d
-      
+
     deploy:
       replicas: 1
       placement:
         constraints:
+          # Hardcoded on purpose: this is one specific machine's DNS server,
+          # not something to move around. It must match `docker node ls`.
           - node.hostname == liaxum-vps
+
+      # Without a limit, a task that cannot bind 53 -- systemd-resolved holding
+      # it is the usual reason -- is recreated every few seconds forever. Three
+      # attempts then stop, so the failure is visible in `docker service ps`
+      # instead of buried under a churn of new task IDs.
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 3
+        window: 120s
+
       labels:
         - "traefik.enable=true"
         - "traefik.swarm.network=web-net"
-        
-        # Access the dashboard at https://pihole.liaxum.fr
+
         - "traefik.http.routers.pihole.rule=Host(`pihole.liaxum.fr`)"
         - "traefik.http.routers.pihole.entrypoints=websecure"
         - "traefik.http.routers.pihole.tls=true"
-        
-        # Pi-hole's web interface runs on port 80 internally
+
+        # Pi-hole v6 serves the UI from its own embedded webserver on 80.
         - "traefik.http.services.pihole.loadbalancer.server.port=80"
-        
-        # Pi-hole requires /admin at the end of the URL. This middleware adds it automatically!
+
+        # The UI lives under /admin and the bare host 404s, so send / there.
+        # $$ is an escaped $ -- compose interpolates the file before swarm sees
+        # it, and a single $ would be eaten.
         - "traefik.http.middlewares.pihole-redirect.redirectregex.regex=^https://pihole.liaxum.fr/$$"
         - "traefik.http.middlewares.pihole-redirect.redirectregex.replacement=https://pihole.liaxum.fr/admin/"
         - "traefik.http.routers.pihole.middlewares=pihole-redirect"

@@ -591,6 +591,82 @@ left behind; `docker config ls` shows them and unreferenced ones can be
 removed. Secrets have no such escape here, so rotating a certificate still
 means removing the secret and redeploying Traefik.
 
+## Pi-hole and port 53
+
+`apps/pihole/compose.yml` is a swarm stack, and swarm's port syntax has **no
+`host_ip` field** — it is documented as unsupported there. So publishing 53
+binds `0.0.0.0:53` on the manager: the mesh address, yes, and the public one
+too. There is no way to narrow it from the compose file.
+
+That matters more than it sounds. An open DNS resolver on a public IP is found
+by scanners within hours and used for amplification attacks — traffic leaves
+your server, aimed at someone else — and providers null-route or suspend
+servers for it.
+
+`apps/nfs/compose.yml` avoids this by not being a swarm stack: standalone
+compose can bind `${MESH_ADDR}:2049` and genuinely cannot be reached from
+outside. Pi-hole cannot take that route, because Traefik runs with
+`--providers.swarm` only and would not discover a standalone container's web
+UI.
+
+So the firewall is the control, and it is load-bearing rather than optional.
+
+### `ufw` will not do it
+
+Docker publishes a port by inserting DNAT rules into `nat/PREROUTING`. The
+packet is then **forwarded** to the container, so it never traverses the
+`INPUT` chain where ufw's rules live. `ufw deny 53` looks like it worked and
+blocks nothing.
+
+Docker jumps to the `DOCKER-USER` chain before its own filter rules, and that
+chain is in `FORWARD`, so this is where the rule belongs:
+
+```bash
+# on the manager -- replace eth0 with its public interface (ip route get 1.1.1.1)
+sudo iptables -I DOCKER-USER -i eth0 -p udp --dport 53 -j DROP
+sudo iptables -I DOCKER-USER -i eth0 -p tcp --dport 53 -j DROP
+
+# survive a reboot
+sudo apt install -y iptables-persistent && sudo netfilter-persistent save
+```
+
+Queries arriving on `tailscale0` are untouched, so mesh clients still resolve.
+
+### Check it from outside
+
+From anywhere that is not on the mesh, against the manager's public address:
+
+```bash
+dig @<public-ip> +short +time=3 example.com
+```
+
+It must time out. An answer means the resolver is open and the rules are not
+in place.
+
+### If the task will not start
+
+`systemd-resolved` binds `127.0.0.53:53`, which is inside `0.0.0.0:53`, so the
+bind fails and the task restarts. `restart_policy` stops after three attempts
+so the failure is visible rather than buried under new task IDs:
+
+```bash
+docker service ps --no-trunc pihole_core
+ss -lnup 'sport = :53'; ss -lntp 'sport = :53'
+```
+
+The fix is on the host — leave `systemd-resolved` running for the host's own
+resolution but stop it listening:
+
+```bash
+sudo mkdir -p /etc/systemd/resolved.conf.d
+printf '[Resolve]\nDNSStubListener=no\n' | sudo tee /etc/systemd/resolved.conf.d/no-stub.conf
+sudo systemctl restart systemd-resolved
+```
+
+`/etc/resolv.conf` must then point somewhere real rather than at `127.0.0.53`,
+or the host loses DNS the moment Pi-hole is down — which takes Tailscale and
+the image pulls with it.
+
 ## Design decisions
 
 ### Hybrid local + NFS volume model
