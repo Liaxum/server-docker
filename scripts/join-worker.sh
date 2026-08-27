@@ -741,20 +741,29 @@ verify_nfs() {
     return 1
   fi
 
-  # One sudo call for the whole probe, and its output goes to a file on the
-  # worker rather than being captured here.
+  # One sudo call for the whole probe, with the redirection INSIDE the sudo'd
+  # shell rather than around it.
   #
-  # Both halves of that matter. Over "ssh -t" sudo's password prompt travels on
-  # the same channel as the command's output, so wrapping this in $( ) swallows
-  # the prompt and the run sits forever waiting for a password it never appeared
-  # to ask for. And every extra sudo is another prompt to type, so mount, write
-  # and unmount are one invocation instead of three.
+  # Both halves of that were learned the hard way. Wrapping this in $( ) captured
+  # sudo's password prompt, and the run hung on a password it never appeared to
+  # ask for. Redirecting around sudo instead -- `sudo sh -c '...' > log 2>&1` --
+  # moved the prompt into the log rather than the terminal on a host whose sudo
+  # writes it to stderr, and the run died on "sudo: timed out". Putting the
+  # redirect after sudo has authenticated leaves the prompt where it can be
+  # answered. And every extra sudo is another prompt to type, so mount, write and
+  # unmount are one invocation rather than three.
   #
-  # Exit codes rather than parsed output, so a failure says which step failed:
-  # 10 mount, 11 write, 12 could not even make the mountpoint. The unmount runs
-  # on the way out of every path, so a failed probe never leaves a mount behind.
+  # Exit codes rather than parsed output, so a failure names the step that
+  # failed: 10 mount, 11 write, 12 could not even make the mountpoint. The
+  # unmount runs on the way out of every path, so a failed probe never leaves a
+  # mount or a stray directory behind.
+  #
+  # The log is created here, as the ssh user, so it can be read and removed
+  # without sudo afterwards; the sudo'd shell only appends to it.
   local rc=0
-  host_run "sudo sh -c '
+  host_eval "rm -f $log && : > $log" >/dev/null 2>&1 || true
+  host_run "sudo sh -c 'exec >>$log 2>&1
+    echo __probe_ran__
     mkdir -p $mnt || exit 12
     if ! mount -t nfs4 -o nfsvers=4,nolock,soft,nosuid,nodev $MESH_ADDR:/monitor-keys $mnt; then
       rmdir $mnt 2>/dev/null
@@ -764,12 +773,26 @@ verify_nfs() {
     umount $mnt 2>/dev/null
     rmdir $mnt 2>/dev/null
     exit \$rc
-  ' > $log 2>&1" || rc=$?
+  '" || rc=$?
 
   if (( rc == 0 )); then
     host_eval "rm -f $log" >/dev/null 2>&1 || true
     ok "mounted and wrote to $MESH_ADDR:/monitor-keys over the mesh"
     return 0
+  fi
+
+  # sudo failing is not the mount failing. Reporting it as one sends people to
+  # inspect an export that was never reached.
+  #
+  # Detected by the marker, not by parsing sudo's message: now that sudo can
+  # prompt on the terminal, what it says never reaches this log. The marker is
+  # the sudo'd shell's first act, so its absence means sudo never got as far as
+  # running anything -- whatever wording this host's sudo uses.
+  if ! host_eval "grep -q __probe_ran__ $log 2>/dev/null"; then
+    warn "the probe could not run: sudo on $WHERE did not authenticate (see its message above)."
+    host_eval "rm -f $log" >/dev/null 2>&1 || true
+    warn "that says nothing about the mount either way. Re-run '--only verify' and answer the prompt, or check by hand on $WHERE: sudo mount -t nfs4 $MESH_ADDR:/monitor-keys /mnt"
+    return 2
   fi
 
   case "$rc" in
@@ -778,7 +801,7 @@ verify_nfs() {
     12) warn "could not create the mountpoint $mnt on $WHERE:" ;;
     *)  warn "the NFS probe failed (exit $rc):" ;;
   esac
-  host_eval "cat $log 2>/dev/null" | tail -5 | sed 's/^/      /' >&2
+  host_eval "cat $log 2>/dev/null" | grep -v __probe_ran__ | tail -5 | sed 's/^/      /' >&2
   host_eval "rm -f $log" >/dev/null 2>&1 || true
 
   if (( rc == 10 )); then
@@ -815,8 +838,13 @@ stage_verify() {
   fi
 
   check_remote_managers || failed=1
-  verify_nfs || failed=1
 
+  # Before the probe, deliberately. The agent is a global service that mounts
+  # the shared keys over NFS, so seeing it Running here is proof the mount
+  # works -- stronger proof than the probe, which only shows this script can
+  # mount it too. Knowing that first lets a probe that could not run be
+  # reported without calling the whole join a failure.
+  local agent=""
   if manager_reachable; then
     local row
     row="$(mgr_eval "docker node ls --format '{{.Hostname}} {{.Status}} {{.Availability}}' 2>/dev/null" | grep -w "$WORKER_HOSTNAME" | head -1)" || row=""
@@ -827,18 +855,32 @@ stage_verify() {
       failed=1
     fi
 
-    # Global service: the swarm schedules it here the moment the node is
-    # ready, so it is the first real test of the mount under docker.
-    local agent
     agent="$(mgr_eval "docker service ps ${MONITOR_STACK}_agent --filter desired-state=running --format '{{.Node}} {{.CurrentState}}' 2>/dev/null" | grep -w "$WORKER_HOSTNAME" | head -1)" || agent=""
     if [[ -n "$agent" ]]; then
-      ok "${MONITOR_STACK}_agent on this node: ${agent#* }"
+      ok "${MONITOR_STACK}_agent on this node: ${agent#* } -- it mounts the keys over NFS, so the mount works"
     else
       warn "${MONITOR_STACK}_agent is not running on $WORKER_HOSTNAME yet. It is a global service, so give it a moment, then: docker service ps --no-trunc ${MONITOR_STACK}_agent"
     fi
   else
     skip "no --manager, so 'docker node ls' was not checked. Run it on the manager to confirm $WORKER_HOSTNAME is there."
   fi
+
+  # 2 means the probe could not run (sudo), which is not evidence either way.
+  # A running agent already settles the question, so do not fail on it then.
+  # "verify_nfs || nfs_rc=$?" not "verify_nfs; case $?": a bare command
+  # returning non-zero is not exempt from set -e, so the script would exit
+  # before the case ever ran.
+  local nfs_rc=0
+  verify_nfs || nfs_rc=$?
+  case "$nfs_rc" in
+    0) ;;
+    2) if [[ -n "$agent" ]]; then
+         skip "the probe did not run, but ${MONITOR_STACK}_agent is mounting the export on this node, which is the thing that matters"
+       else
+         failed=1
+       fi ;;
+    *) failed=1 ;;
+  esac
 
   (( failed )) && die "the node is not fully joined (see above)"
 
@@ -847,8 +889,8 @@ stage_verify() {
   $WORKER_HOSTNAME is on the mesh at $WORKER_MESH_ADDR and in the swarm.
 
   Komodo picks the node up through the agent, which is global and mounts the
-  shared keys over NFS -- the mount is verified above. Nothing else has to be
-  deployed here: swarm schedules onto it.
+  shared keys over NFS. Nothing else has to be deployed here: swarm schedules
+  onto it.
 
 EOF
   ok "worker ready"
