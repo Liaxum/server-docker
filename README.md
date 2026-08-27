@@ -611,6 +611,52 @@ UI.
 
 So the firewall is the control, and it is load-bearing rather than optional.
 
+### Stack environment
+
+Komodo lets you attach an environment to a stack, and the compose file reads
+its values. Everything has a default matching this cluster except the password,
+which is required:
+
+| Variable | Default | |
+| --- | --- | --- |
+| `PIHOLE_PASSWORD` | — | **required**; the deploy fails without it |
+| `DOMAIN` | `liaxum.fr` | |
+| `PIHOLE_SUBDOMAIN` | `pihole` | |
+| `MANAGER_HOSTNAME` | `liaxum-vps` | must match `docker node ls` |
+| `PIHOLE_UPSTREAMS` | `1.1.1.1;8.8.8.8` | v6 syntax, semicolon separated |
+| `TZ` | `Europe/Paris` | |
+
+The password is the reason to bother. It is written `${PIHOLE_PASSWORD:?...}`
+rather than `${PIHOLE_PASSWORD}` because an unset plain `${VAR}` interpolates
+to an empty string **silently** — and an empty Pi-hole API password means the
+admin UI stops asking for one. `:?` fails the deploy instead:
+
+```
+required variable PIHOLE_PASSWORD is missing a value: set PIHOLE_PASSWORD in
+the stack environment
+```
+
+Everything else uses `${VAR:-default}` for the same reason from the other
+direction. An unset `${MANAGER_HOSTNAME}` would leave `node.hostname == ` — a
+constraint that matches no node, so the service sits at 0/1 forever with
+nothing to explain it.
+
+That care is warranted because **the two deploy paths do not read the same
+sources**:
+
+| | `docker compose` | `docker stack deploy` |
+| --- | --- | --- |
+| reads `.env` in the directory | yes | **no** |
+| reads exported environment variables | yes | yes |
+
+So a `.env` file that works perfectly under `docker compose` is ignored
+entirely by `docker stack deploy`, which interpolates every `${VAR}` to an
+empty string without complaint. If your Komodo stack uses swarm, confirm it
+exports the environment rather than only writing a `.env` beside the file. The
+password guard doubles as the test: if the deploy fails complaining about
+`PIHOLE_PASSWORD` when you have set it, the environment is not reaching
+interpolation.
+
 ### `ufw` will not do it
 
 Docker publishes a port by inserting DNAT rules into `nat/PREROUTING`. The

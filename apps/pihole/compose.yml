@@ -2,6 +2,11 @@
 #
 # Network-wide DNS for the mesh, pinned to the VPS.
 #
+# Values come from the stack environment. Everything has a default that matches
+# this cluster except PIHOLE_PASSWORD, which is required and fails the deploy if
+# it is missing -- see "Pi-hole and port 53" in the README for the full list and
+# for how Komodo supplies them.
+#
 # BEFORE FIRST DEPLOY, read "Pi-hole and port 53" in the README. Swarm cannot
 # bind a published port to one address, so this listens on 53 on EVERY
 # interface of the manager -- the public one included. An open resolver on a
@@ -35,17 +40,23 @@ services:
         mode: host
 
     environment:
-      - TZ=Europe/Paris
+      - TZ=${TZ:-Europe/Paris}
 
-      # Change this before deploying, and treat the value below as burned: an
-      # earlier one was committed to this repo and is in the git history.
-      - FTLCONF_webserver_api_password=CHANGE_ME
+      # Required, with no default on purpose. A plain ${VAR} interpolates to
+      # an empty string when unset, silently, and an empty Pi-hole API password
+      # means the admin UI stops asking for one -- a footgun that only shows up
+      # when someone finds the panel. ":?" makes the deploy fail instead.
+      #
+      # This is the main reason to use the stack environment at all: the
+      # password stops living in the file, and so stops living in git. The one
+      # that was committed here before is in the history and is burned.
+      - FTLCONF_webserver_api_password=${PIHOLE_PASSWORD:?set PIHOLE_PASSWORD in the stack environment}
 
       # Stated rather than left to the image default, and matched to the
       # nameservers headscale hands out in apps/vpn/config.yaml.template so
       # mesh clients get the same answers whichever resolver they reach.
       # v6 syntax: semicolon separated.
-      - FTLCONF_dns_upstreams=1.1.1.1;8.8.8.8
+      - FTLCONF_dns_upstreams=${PIHOLE_UPSTREAMS:-1.1.1.1;8.8.8.8}
 
       # Stated explicitly because the default does not suit this topology.
       # Pi-hole's other listening modes decide "local" from its own interface
@@ -66,9 +77,10 @@ services:
       replicas: 1
       placement:
         constraints:
-          # Hardcoded on purpose: this is one specific machine's DNS server,
-          # not something to move around. It must match `docker node ls`.
-          - node.hostname == liaxum-vps
+          # Defaulted, never bare. An unset ${MANAGER_HOSTNAME} would leave
+          # "node.hostname == ", which matches no node at all: the service sits
+          # at 0/1 forever and nothing explains why.
+          - node.hostname == ${MANAGER_HOSTNAME:-liaxum-vps}
 
       # Without a limit, a task that cannot bind 53 -- systemd-resolved holding
       # it is the usual reason -- is recreated every few seconds forever. Three
@@ -84,7 +96,7 @@ services:
         - "traefik.enable=true"
         - "traefik.swarm.network=web-net"
 
-        - "traefik.http.routers.pihole.rule=Host(`pihole.liaxum.fr`)"
+        - "traefik.http.routers.pihole.rule=Host(`${PIHOLE_SUBDOMAIN:-pihole}.${DOMAIN:-liaxum.fr}`)"
         - "traefik.http.routers.pihole.entrypoints=websecure"
         - "traefik.http.routers.pihole.tls=true"
 
@@ -94,8 +106,8 @@ services:
         # The UI lives under /admin and the bare host 404s, so send / there.
         # $$ is an escaped $ -- compose interpolates the file before swarm sees
         # it, and a single $ would be eaten.
-        - "traefik.http.middlewares.pihole-redirect.redirectregex.regex=^https://pihole.liaxum.fr/$$"
-        - "traefik.http.middlewares.pihole-redirect.redirectregex.replacement=https://pihole.liaxum.fr/admin/"
+        - "traefik.http.middlewares.pihole-redirect.redirectregex.regex=^https://${PIHOLE_SUBDOMAIN:-pihole}.${DOMAIN:-liaxum.fr}/$$"
+        - "traefik.http.middlewares.pihole-redirect.redirectregex.replacement=https://${PIHOLE_SUBDOMAIN:-pihole}.${DOMAIN:-liaxum.fr}/admin/"
         - "traefik.http.routers.pihole.middlewares=pihole-redirect"
 
 networks:
