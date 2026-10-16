@@ -711,6 +711,56 @@ Changing the volume's `device` or `o` options is different: Docker stores
 those on the volume at creation and ignores the updated stack file, so the
 volume has to be removed on every node first (see below).
 
+### `Core failed to validate Periphery public key`
+
+```json
+{ "name": "liaxum-mini",
+  "err": { "error": "Core failed to validate Periphery public key",
+           "trace": ["Ensure public key matches configured Periphery Public Key",
+                     "MCowBQYDK2Vu... is invalid"] } }
+```
+
+Periphery generates its **own** keypair in its keys directory at boot and
+registers the public half with core, which records it against that one server.
+So the keys directory is per-agent identity, not shared state — and `agent`
+runs `mode: global`.
+
+Pointing every agent at the shared NFS mount therefore had every node writing
+one keypair into one directory. Whichever agent regenerated last took the
+others' identity with it, and core rejected the rest. It only looked fine while
+there was a single node.
+
+`apps/monitor/compose.yml` now gives each agent a node-local `agent-keys`
+volume for its own keys and mounts the share read-only at `/config/core`
+purely to read `core.pub`. Redeploying is not enough on its own, because both
+sides still hold stale state:
+
+```bash
+# 1. the share has periphery keys that no longer belong to anyone.
+#    core.pub is core's and must stay.
+docker exec nfs-server ls -la /shared/monitor-keys
+docker exec nfs-server sh -c 'cd /shared/monitor-keys && ls | grep -v "^core.pub$"'
+#    remove only what that last command listed
+
+# 2. redeploy; each agent now generates its own keypair in its own volume
+docker stack deploy -c apps/monitor/compose.yml monitor
+
+# 3. clear the recorded key per server in the Komodo UI
+#    Servers -> <server> -> Config -> Periphery Public Key: empty it, then
+#    re-onboard with a fresh onboarding key so core records the new key
+docker service logs --tail 50 monitor_agent
+```
+
+Step 3 is the one that is easy to miss: core keeps the old public key on the
+`Server` resource, so a correctly-working agent still gets rejected until that
+field is cleared or replaced.
+
+A note on the key in the error, in case it sends you down the wrong path: it
+decodes to an **X25519** key (OID 1.3.101.110), while the docs say core
+generates **Ed25519** (1.3.101.112). That difference is not the fault —
+periphery and core do not use the same algorithm — so do not go looking for a
+key-type mismatch.
+
 ### Purge cached NFS volumes across the cluster
 
 After any change to the `keys` volume definition:
