@@ -1,9 +1,22 @@
 # docker stack deploy -c apps/monitor/compose.yml monitor
 #
 # The `agent` service runs globally, so periphery instances land on remote
-# hardware that cannot see core's local /config/keys. The `keys` volume is
-# therefore an NFS mount of /shared/monitor-keys exported by apps/nfs over
-# Tailscale, which is how the agents pick up the core.pub that core writes.
+# hardware that cannot see core's local /config/keys. The `keys` volume is an
+# NFS mount of /shared/monitor-keys exported by apps/nfs over Tailscale, which
+# is how the agents pick up the core.pub that core writes.
+#
+# That share is READ-ONLY for the agents, and is not where they keep their own
+# keys. Periphery generates its own keypair in its keys directory at boot and
+# registers the public half with core, which records it against that one
+# server. A global service pointed at a shared directory therefore has every
+# node writing one keypair: whichever agent regenerates last takes the others'
+# identity with it, and core rejects the rest with
+#
+#   Core failed to validate Periphery public key
+#   Ensure public key matches configured Periphery Public Key
+#
+# So each agent gets a private, node-local volume for its own keys, and reads
+# core.pub from the share separately.
 services:
   db:
     image: mongo:6
@@ -46,12 +59,21 @@ services:
     environment:
       - PERIPHERY_CORE_ADDRESS=wss://${MONITOR_SUBDOMAIN:-monitor}.${DOMAIN:-liaxum.fr}
       - PERIPHERY_CONNECT_AS={{ .Node.Hostname }}
-      - PERIPHERY_CORE_PUBLIC_KEYS=file:/config/keys/core.pub
+      # Read out of the share, which is mounted read-only below. Core writes
+      # this file; no agent ever should.
+      - PERIPHERY_CORE_PUBLIC_KEYS=file:/config/core/core.pub
       # Created in the Komodo UI once core is running, so it cannot be known
       # at first deploy. bootstrap.sh asks for it and redeploys.
       - PERIPHERY_ONBOARDING_KEY=${KOMODO_ONBOARDING_KEY:-}
     volumes:
-      - keys:/config/keys
+      # Node-local and private. The local driver gives each node its own
+      # instance of a named volume, so every agent generates and keeps its own
+      # periphery keypair here and the identities stay distinct.
+      - agent-keys:/config/keys
+      # The share, read-only, purely to read core.pub. :ro is the guard that
+      # keeps a future periphery release from writing its keys here and
+      # recreating the collision.
+      - keys:/config/core:ro
       - /var/run/docker.sock:/var/run/docker.sock
       - /proc:/proc
     networks:
@@ -92,6 +114,8 @@ networks:
 volumes:
   mongo-data:
   mongo-config:
+  # Per-node, not shared: see the note at the top of this file.
+  agent-keys:
   keys:
     driver: local
     driver_opts:
