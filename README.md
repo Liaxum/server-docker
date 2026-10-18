@@ -472,6 +472,31 @@ The `docker node ls` and agent lines need `--manager`; without it they are
 skipped with a note, and a probe that cannot run then has nothing to fall back
 on and does fail.
 
+### Docker access for the ssh user
+
+The docker socket is root-owned and group `docker`, so an ssh user outside that
+group gets this from every docker call:
+
+```
+permission denied while trying to connect to the docker API at unix:///var/run/docker.sock
+```
+
+Which `command -v docker` does not catch — installed and usable are different
+questions, and the `host` stage now asks both. It reports `docker installed`
+for the binary and `docker usable as <user>` for the socket.
+
+When the socket is out of reach it offers to add the ssh user to the `docker`
+group. That is the fix worth making: group membership is read at login, and
+every step here opens its own ssh session, so the next call picks it up without
+anyone logging out, and no later run needs sudo for docker at all.
+
+Decline it and the run continues through `sudo docker` instead — it works, it
+just asks for a password at each docker step, and the script says so once.
+Neither available is a hard stop with the command to run.
+
+`--uninstall --with-host` removes the user from the group again, but only if
+this script was the one that added it.
+
 ### sudo and the probe
 
 Mounting needs root, so on a worker whose ssh user is not root and whose sudo
@@ -610,6 +635,128 @@ creates a new object rather than trying to rewrite one. Superseded objects are
 left behind; `docker config ls` shows them and unreferenced ones can be
 removed. Secrets have no such escape here, so rotating a certificate still
 means removing the secret and redeploying Traefik.
+
+## Pi-hole and port 53
+
+`apps/pihole/compose.yml` is a swarm stack, and swarm's port syntax has **no
+`host_ip` field** — it is documented as unsupported there. So publishing 53
+binds `0.0.0.0:53` on the manager: the mesh address, yes, and the public one
+too. There is no way to narrow it from the compose file.
+
+That matters more than it sounds. An open DNS resolver on a public IP is found
+by scanners within hours and used for amplification attacks — traffic leaves
+your server, aimed at someone else — and providers null-route or suspend
+servers for it.
+
+`apps/nfs/compose.yml` avoids this by not being a swarm stack: standalone
+compose can bind `${MESH_ADDR}:2049` and genuinely cannot be reached from
+outside. Pi-hole cannot take that route, because Traefik runs with
+`--providers.swarm` only and would not discover a standalone container's web
+UI.
+
+So the firewall is the control, and it is load-bearing rather than optional.
+
+### Stack environment
+
+Komodo lets you attach an environment to a stack, and the compose file reads
+its values. Everything has a default matching this cluster except the password,
+which is required:
+
+| Variable | Default | |
+| --- | --- | --- |
+| `PIHOLE_PASSWORD` | — | **required**; the deploy fails without it |
+| `DOMAIN` | `liaxum.fr` | |
+| `PIHOLE_SUBDOMAIN` | `pihole` | |
+| `MANAGER_HOSTNAME` | `liaxum-vps` | must match `docker node ls` |
+| `PIHOLE_UPSTREAMS` | `1.1.1.1;8.8.8.8` | v6 syntax, semicolon separated |
+| `TZ` | `Europe/Paris` | |
+
+The password is the reason to bother. It is written `${PIHOLE_PASSWORD:?...}`
+rather than `${PIHOLE_PASSWORD}` because an unset plain `${VAR}` interpolates
+to an empty string **silently** — and an empty Pi-hole API password means the
+admin UI stops asking for one. `:?` fails the deploy instead:
+
+```
+required variable PIHOLE_PASSWORD is missing a value: set PIHOLE_PASSWORD in
+the stack environment
+```
+
+Everything else uses `${VAR:-default}` for the same reason from the other
+direction. An unset `${MANAGER_HOSTNAME}` would leave `node.hostname == ` — a
+constraint that matches no node, so the service sits at 0/1 forever with
+nothing to explain it.
+
+That care is warranted because **the two deploy paths do not read the same
+sources**:
+
+| | `docker compose` | `docker stack deploy` |
+| --- | --- | --- |
+| reads `.env` in the directory | yes | **no** |
+| reads exported environment variables | yes | yes |
+
+So a `.env` file that works perfectly under `docker compose` is ignored
+entirely by `docker stack deploy`, which interpolates every `${VAR}` to an
+empty string without complaint. If your Komodo stack uses swarm, confirm it
+exports the environment rather than only writing a `.env` beside the file. The
+password guard doubles as the test: if the deploy fails complaining about
+`PIHOLE_PASSWORD` when you have set it, the environment is not reaching
+interpolation.
+
+### `ufw` will not do it
+
+Docker publishes a port by inserting DNAT rules into `nat/PREROUTING`. The
+packet is then **forwarded** to the container, so it never traverses the
+`INPUT` chain where ufw's rules live. `ufw deny 53` looks like it worked and
+blocks nothing.
+
+Docker jumps to the `DOCKER-USER` chain before its own filter rules, and that
+chain is in `FORWARD`, so this is where the rule belongs:
+
+```bash
+# on the manager -- replace eth0 with its public interface (ip route get 1.1.1.1)
+sudo iptables -I DOCKER-USER -i eth0 -p udp --dport 53 -j DROP
+sudo iptables -I DOCKER-USER -i eth0 -p tcp --dport 53 -j DROP
+
+# survive a reboot
+sudo apt install -y iptables-persistent && sudo netfilter-persistent save
+```
+
+Queries arriving on `tailscale0` are untouched, so mesh clients still resolve.
+
+### Check it from outside
+
+From anywhere that is not on the mesh, against the manager's public address:
+
+```bash
+dig @<public-ip> +short +time=3 example.com
+```
+
+It must time out. An answer means the resolver is open and the rules are not
+in place.
+
+### If the task will not start
+
+`systemd-resolved` binds `127.0.0.53:53`, which is inside `0.0.0.0:53`, so the
+bind fails and the task restarts. `restart_policy` stops after three attempts
+so the failure is visible rather than buried under new task IDs:
+
+```bash
+docker service ps --no-trunc pihole_core
+ss -lnup 'sport = :53'; ss -lntp 'sport = :53'
+```
+
+The fix is on the host — leave `systemd-resolved` running for the host's own
+resolution but stop it listening:
+
+```bash
+sudo mkdir -p /etc/systemd/resolved.conf.d
+printf '[Resolve]\nDNSStubListener=no\n' | sudo tee /etc/systemd/resolved.conf.d/no-stub.conf
+sudo systemctl restart systemd-resolved
+```
+
+`/etc/resolv.conf` must then point somewhere real rather than at `127.0.0.53`,
+or the host loses DNS the moment Pi-hole is down — which takes Tailscale and
+the image pulls with it.
 
 ## Design decisions
 
@@ -775,6 +922,56 @@ export is right the service recovers on its own; force it with
 Changing the volume's `device` or `o` options is different: Docker stores
 those on the volume at creation and ignores the updated stack file, so the
 volume has to be removed on every node first (see below).
+
+### `Core failed to validate Periphery public key`
+
+```json
+{ "name": "liaxum-mini",
+  "err": { "error": "Core failed to validate Periphery public key",
+           "trace": ["Ensure public key matches configured Periphery Public Key",
+                     "MCowBQYDK2Vu... is invalid"] } }
+```
+
+Periphery generates its **own** keypair in its keys directory at boot and
+registers the public half with core, which records it against that one server.
+So the keys directory is per-agent identity, not shared state — and `agent`
+runs `mode: global`.
+
+Pointing every agent at the shared NFS mount therefore had every node writing
+one keypair into one directory. Whichever agent regenerated last took the
+others' identity with it, and core rejected the rest. It only looked fine while
+there was a single node.
+
+`apps/monitor/compose.yml` now gives each agent a node-local `agent-keys`
+volume for its own keys and mounts the share read-only at `/config/core`
+purely to read `core.pub`. Redeploying is not enough on its own, because both
+sides still hold stale state:
+
+```bash
+# 1. the share has periphery keys that no longer belong to anyone.
+#    core.pub is core's and must stay.
+docker exec nfs-server ls -la /shared/monitor-keys
+docker exec nfs-server sh -c 'cd /shared/monitor-keys && ls | grep -v "^core.pub$"'
+#    remove only what that last command listed
+
+# 2. redeploy; each agent now generates its own keypair in its own volume
+docker stack deploy -c apps/monitor/compose.yml monitor
+
+# 3. clear the recorded key per server in the Komodo UI
+#    Servers -> <server> -> Config -> Periphery Public Key: empty it, then
+#    re-onboard with a fresh onboarding key so core records the new key
+docker service logs --tail 50 monitor_agent
+```
+
+Step 3 is the one that is easy to miss: core keeps the old public key on the
+`Server` resource, so a correctly-working agent still gets rejected until that
+field is cleared or replaced.
+
+A note on the key in the error, in case it sends you down the wrong path: it
+decodes to an **X25519** key (OID 1.3.101.110), while the docs say core
+generates **Ed25519** (1.3.101.112). That difference is not the fault —
+periphery and core do not use the same algorithm — so do not go looking for a
+key-type mismatch.
 
 ### Purge cached NFS volumes across the cluster
 
