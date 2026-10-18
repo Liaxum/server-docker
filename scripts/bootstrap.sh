@@ -259,6 +259,9 @@ require_settings() {
   done
   export HEADPLANE_API_KEY="${HEADPLANE_API_KEY:-}"
   export HEADPLANE_COOKIE_SECRET="${HEADPLANE_COOKIE_SECRET:-}"
+  # Defaulted rather than demanded: it repeats the compose file's own default,
+  # so a bootstrap.env written before this setting existed still deploys.
+  export KOMODO_ROOT_DIR="${KOMODO_ROOT_DIR:-/etc/komodo}"
 }
 
 write_env() {
@@ -277,6 +280,7 @@ FILES_SUBDOMAIN=$FILES_SUBDOMAIN
 MONITOR_STACK=$MONITOR_STACK
 MONITOR_SUBDOMAIN=$MONITOR_SUBDOMAIN
 MCP_SUBDOMAIN=$MCP_SUBDOMAIN
+KOMODO_ROOT_DIR=$KOMODO_ROOT_DIR
 MESH_USER=$MESH_USER
 SWARM_ADVERTISE_ADDR=$SWARM_ADVERTISE_ADDR
 KOMODO_ONBOARDING_KEY=$KOMODO_ONBOARDING_KEY
@@ -318,6 +322,13 @@ stage_config() {
   ask MONITOR_STACK      "Stack name for komodo"       "monitor"
   ask MONITOR_SUBDOMAIN  "Subdomain for komodo"        "monitor"
   ask MCP_SUBDOMAIN      "Subdomain for the komodo MCP server" "mcp"
+
+  # The agent binds this one at the same path inside and outside its
+  # container, so a relative path would name two different directories. Kept
+  # to plain characters: the host stage passes it to a shell over ssh.
+  ask KOMODO_ROOT_DIR "Directory the komodo agent keeps repos and stacks in" "/etc/komodo"
+  [[ "$KOMODO_ROOT_DIR" =~ ^/[A-Za-z0-9._/@+-]+$ ]] \
+    || die "KOMODO_ROOT_DIR '$KOMODO_ROOT_DIR' is not a plain absolute path: it has to start with / and hold no spaces or shell metacharacters."
 
   ask CRT_FILE "TLS certificate file" "$(detect_pem cert || echo "$CERT_DIR/certificate.pem")"
   ask KEY_FILE "TLS private key file" "$(detect_pem key  || echo "$CERT_DIR/private.key")"
@@ -703,6 +714,26 @@ ensure_vpn_dir() {
   record "created_dir /opt/vpn/data"
 }
 
+# The agent is global, so this has to exist on every node that can run it --
+# and the bind is what makes periphery's paths mean the same thing to the host
+# daemon as they do inside the container. Docker would create it when the task
+# first starts, but then a path that cannot be created -- a typo, or a mount
+# point that is not mounted yet -- surfaces as a task that will not start,
+# rather than here where it can be said plainly.
+ensure_komodo_root() {
+  local where="${SSH_TARGET:-this machine}"
+  # This stage runs before the settings are required, so fall back to the
+  # same default the compose file carries rather than to an unset variable.
+  local root="${KOMODO_ROOT_DIR:-/etc/komodo}"
+  host_eval "test -d $root" && { skip "$root exists"; return; }
+
+  may_fix "$root does not exist on $where (the komodo agent's repos and stacks). Create it?" \
+    || { blocker "$root does not exist on $where. Create it, or re-run with --with-host-setup."; return; }
+
+  host_run "sudo mkdir -p $root"
+  record "created_komodo_root $root"
+}
+
 ensure_ufw_rule() {
   host_eval 'command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "^Status: active"' \
     || { skip "ufw inactive or absent; nothing to open"; return; }
@@ -731,6 +762,7 @@ stage_host() {
   ensure_nfs_kernel
   ensure_swarm
   ensure_vpn_dir
+  ensure_komodo_root
   ensure_ufw_rule
 
   ok "$where ready"
@@ -1390,6 +1422,18 @@ undo_host() {
     fi
   fi
 
+  # From the record rather than from KOMODO_ROOT_DIR: --reconfigure may have
+  # moved the setting since, and what we made is what we may remove.
+  local root
+  root="$(printf '%s\n' "$state" | grep -m1 '^created_komodo_root ' | cut -d' ' -f2-)" || true
+  if [[ -n "$root" ]]; then
+    if (( WITH_DATA )); then
+      host_run "sudo rm -rf $root"
+    else
+      skip "$root kept (holds the repos and compose files of the stacks komodo deployed; --with-data removes it)"
+    fi
+  fi
+
   was="$(printf '%s\n' "$state" | grep -m1 '^hostname_was ' | cut -d' ' -f2-)" || true
   if [[ -n "$was" ]]; then
     if host_eval 'command -v hostnamectl >/dev/null 2>&1'; then
@@ -1429,6 +1473,11 @@ do_uninstall() {
   fi
   if (( WITH_HOST )); then
     printf '    %shost:    packages, swarm membership, tailscale and the hostname this script changed%s\n' "$RED" "$OFF"
+    if (( WITH_DATA )); then
+      printf '    %s         and the directories it created: headscale state, komodo agent root%s\n' "$RED" "$OFF"
+    else
+      printf '             the directories it created are kept; --with-data removes them\n'
+    fi
   else
     printf '    host:    untouched (pass --with-host to undo what this script changed)\n'
   fi

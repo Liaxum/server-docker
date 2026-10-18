@@ -37,6 +37,20 @@ sudo apt update && sudo apt install -y nfs-common
 sudo pacman -S nfs-utils
 ```
 
+### Komodo agent root directory (every node)
+
+The agent binds `KOMODO_ROOT_DIR` (default `/etc/komodo`) at the same path
+inside and outside its container, so the directory has to exist on every node
+the agent can land on. Both scripts create it, so this too is what they do
+rather than something to run by hand:
+
+```bash
+sudo mkdir -p /etc/komodo
+```
+
+Why the path has to match on both sides:
+[The agent's root directory](#the-agents-root-directory).
+
 ### VPS firewall (UFW on `liaxum-vps`)
 
 Allow NFS strictly over the Tailscale interface:
@@ -237,14 +251,18 @@ hostname_was ubuntu
 installed_package apt-get nfs-common
 swarm_init
 created_dir /opt/vpn/data
+created_komodo_root /etc/komodo
 installed_tailscale
 ```
 
 Only recorded changes are undone. A package that was already installed, a
 swarm that already existed, a hostname nobody changed — none of it is
 recorded, so none of it is touched. The record is printed before the reversal
-runs, so you can see exactly what is about to be undone. `/opt/vpn/data` is
-kept unless `--with-data` is given, since it holds headscale's database.
+runs, so you can see exactly what is about to be undone. `/opt/vpn/data` and
+`KOMODO_ROOT_DIR` are kept unless `--with-data` is given, since they hold
+headscale's database and the stacks Komodo deployed. `join-worker.sh` has no
+`--with-data`: it reports the root directory as kept, names the path, and
+leaves removing it to you.
 
 Volumes on worker nodes remain out of reach from the manager — run
 `join-worker.sh --leave` against each worker, which removes them there.
@@ -266,6 +284,7 @@ beforehand overrides the stored value.
 | `*_SUBDOMAIN` | subdomains: `VPN_`, `FILES_`, `MONITOR_`, `MCP_` |
 | `CRT_FILE` / `KEY_FILE` | TLS material; detected in `traefik/secret/` by content |
 | `MESH_USER` | headscale user that nodes enrol under |
+| `KOMODO_ROOT_DIR` | the agent's repos and stacks; bound at the same path inside and outside the container |
 | `KOMODO_ONBOARDING_KEY` | created in Komodo once core runs; the monitor stage asks |
 | `HEADPLANE_API_KEY` | minted in headplane, so blank on a first run |
 | `HEADPLANE_COOKIE_SECRET` | generated if you accept the default |
@@ -354,9 +373,10 @@ internet even though the join itself went over the mesh. The script always
 passes the address headscale handed out.
 
 `host` installs Docker, the NFS *client* utilities and the `nfs` kernel module
-— not `nfsd`, which is the server's and runs only on the manager — and sets
-the hostname before the swarm records it. Each change is offered individually
-and defaults to yes; `--with-host-setup` accepts them all.
+— not `nfsd`, which is the server's and runs only on the manager — creates
+`KOMODO_ROOT_DIR`, and sets the hostname before the swarm records it. Each
+change is offered individually and defaults to yes; `--with-host-setup`
+accepts them all.
 
 ### With and without `--manager`
 
@@ -606,6 +626,37 @@ copying keys around:
 - Filebrowser, being pinned to the VPS, binds `nfs_data` directly and skips
   the network round-trip entirely.
 
+### The agent's root directory
+
+`agent` writes the repos it clones and the compose files of Komodo-managed
+Stacks under `PERIPHERY_ROOT_DIRECTORY` (`KOMODO_ROOT_DIR`, default
+`/etc/komodo`), and it drives Docker through the socket it mounts — the
+*host's* daemon, not one of its own. So every path periphery produces is read
+twice: inside the container, where it wrote the file, and on the host, where
+the daemon resolves it. Anything relative to that directory — bind mounts,
+`env_file`, build contexts — resolves only if both readings name one
+directory, which is why the mount is `${KOMODO_ROOT_DIR}:${KOMODO_ROOT_DIR}`
+rather than something tidier on the inside. Upstream's own compose file puts
+it more briefly: "Must be the same inside and outside the container, or docker
+will get confused"
+([komodo#180](https://github.com/moghtech/komodo/discussions/180)).
+
+The mount is also what makes those files survive. Without it they sit in the
+container's writable layer, and an image pull, a redeploy or a reboot takes
+every managed Stack's compose file with it. Neither failure shows up until a
+Stack or Repo is actually deployed from the Komodo UI, so an agent with no
+root directory bound looks perfectly healthy.
+
+`agent` is `mode: global`, so this has to hold on every node that can run it.
+Both host stages create the directory — `bootstrap.sh` on the manager,
+`join-worker.sh` on each worker — and `KOMODO_ROOT_DIR` lives in
+`bootstrap.env`, which `join-worker.sh` reads, so the manager and the workers
+agree without it being typed twice. Docker would create a missing bind source
+on its own, but only when a task first starts: creating it in the host stage
+means a path that cannot be created — a typo, a mount point that is not
+mounted yet — is reported by the stage that asked for it, rather than as a
+task that will not start.
+
 ### UID squashing
 
 Two paths reach this storage and they have to agree on ownership:
@@ -651,6 +702,20 @@ docker exec -it nfs-server ls -la /shared/monitor-keys
 # From an agent on a worker node — proves the NFS mount actually resolved
 docker exec -it $(docker ps -qf name=monitor_agent) ls -la /config/keys
 ```
+
+### Check the agent's root directory
+
+Both sides of the bind have to list the same thing, or the compose files
+periphery writes mean something different to the host's daemon than they do to
+periphery:
+
+```bash
+# On a node running the agent
+ls -la /etc/komodo
+docker exec -it $(docker ps -qf name=monitor_agent) ls -la /etc/komodo
+```
+
+Empty on both sides is normal until a Stack or Repo is deployed from the UI.
 
 ### `failed to mount local volume: ... no such file or directory`
 

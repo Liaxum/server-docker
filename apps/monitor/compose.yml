@@ -50,10 +50,19 @@ services:
       # Created in the Komodo UI once core is running, so it cannot be known
       # at first deploy. bootstrap.sh asks for it and redeploys.
       - PERIPHERY_ONBOARDING_KEY=${KOMODO_ONBOARDING_KEY:-}
+      - PERIPHERY_ROOT_DIRECTORY=${KOMODO_ROOT_DIR:-/etc/komodo}
     volumes:
       - keys:/config/keys
       - /var/run/docker.sock:/var/run/docker.sock
       - /proc:/proc
+      # Periphery clones repos and writes the compose files of Komodo-managed
+      # stacks under PERIPHERY_ROOT_DIRECTORY, then drives the *host* daemon
+      # through the socket above -- which resolves those paths on the host, not
+      # in here. Binding the directory at the same path on both sides is what
+      # makes the two readings name one directory; see
+      # https://github.com/moghtech/komodo/discussions/180. It also outlives
+      # the task, which a container-only path would not.
+      - ${KOMODO_ROOT_DIR:-/etc/komodo}:${KOMODO_ROOT_DIR:-/etc/komodo}
     networks:
       - komodo-net
     deploy:

@@ -270,6 +270,7 @@ VPN_SUBDOMAIN=$VPN_SUBDOMAIN
 MESH_ADDR=$MESH_ADDR
 MESH_USER=$MESH_USER
 MONITOR_STACK=$MONITOR_STACK
+KOMODO_ROOT_DIR=$KOMODO_ROOT_DIR
 WORKER_HOSTNAME=$WORKER_HOSTNAME
 EOF
   ok "saved $WORKER_ENV_FILE"
@@ -296,6 +297,10 @@ require_settings() {
     [[ -n "${!v:-}" ]] || die "$v is not set. Run '$0 --only config' first, or export it."
   done
   export VPN_STACK="${VPN_STACK:-vpn}"
+  # Defaulted rather than demanded: it repeats the default the monitor compose
+  # file carries, so a worker.env written before this setting existed still
+  # joins.
+  export KOMODO_ROOT_DIR="${KOMODO_ROOT_DIR:-/etc/komodo}"
 }
 
 
@@ -309,6 +314,12 @@ stage_config() {
   ask MESH_ADDR      "The manager's address on the mesh"  "100.64.0.1"
   ask MESH_USER      "Headscale user to enrol this node as" "admin"
   ask MONITOR_STACK  "Name of the monitoring stack"       "monitor"
+  # Cluster-wide: the agent binds it at this path on every node, so it has to
+  # be what the manager deployed with. bootstrap.env answers it when the
+  # manager was built from this checkout.
+  ask KOMODO_ROOT_DIR "Directory the komodo agent keeps repos and stacks in" "/etc/komodo"
+  [[ "$KOMODO_ROOT_DIR" =~ ^/[A-Za-z0-9._/@+-]+$ ]] \
+    || die "KOMODO_ROOT_DIR '$KOMODO_ROOT_DIR' is not a plain absolute path: it has to start with / and hold no spaces or shell metacharacters."
 
   local current
   current="$(host_eval 'hostname -s' 2>/dev/null)" || current=""
@@ -393,12 +404,29 @@ ensure_nfs_module() {
   record "loaded_nfs_module"
 }
 
+# The agent is a global service, so it lands here too, and it binds this
+# directory at the same path inside and outside its container -- the only way
+# the compose files periphery writes mean the same thing to this host's docker
+# daemon as they do in the container. Docker would create it when the task
+# first starts, but then a path that cannot be created says so as a task that
+# will not start rather than here.
+ensure_komodo_root() {
+  host_eval "test -d $KOMODO_ROOT_DIR" && { skip "$KOMODO_ROOT_DIR exists"; return; }
+
+  may_fix "$KOMODO_ROOT_DIR does not exist on $WHERE (the komodo agent's repos and stacks). Create it?" \
+    || { blocker "$KOMODO_ROOT_DIR does not exist on $WHERE. Create it, or re-run with --with-host-setup."; return; }
+
+  host_run "sudo mkdir -p $KOMODO_ROOT_DIR"
+  record "created_komodo_root $KOMODO_ROOT_DIR"
+}
+
 stage_host() {
   info "host prerequisites on $WHERE"
   ensure_hostname
   ensure_docker
   ensure_nfs_client
   ensure_nfs_module
+  ensure_komodo_root
   ok "$WHERE ready"
 }
 
@@ -946,6 +974,15 @@ undo_host() {
 
   if grep -qx 'loaded_nfs_module' <<< "$state"; then
     host_run 'sudo rm -f /etc/modules-load.d/nfs-client.conf' || true
+  fi
+
+  # Left alone deliberately: it holds the repos and compose files of whatever
+  # komodo deployed on this node, which outlive the node's membership. Remove
+  # it by hand once you are sure nothing in it is wanted.
+  local root
+  root="$(printf '%s\n' "$state" | grep -m1 '^created_komodo_root ' | cut -d' ' -f2-)" || true
+  if [[ -n "$root" ]]; then
+    skip "$root kept (holds the repos and compose files of the stacks komodo deployed here)"
   fi
 
   # Last of the packages: removing docker earlier would take the daemon out
