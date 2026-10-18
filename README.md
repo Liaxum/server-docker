@@ -452,6 +452,31 @@ The `docker node ls` and agent lines need `--manager`; without it they are
 skipped with a note, and a probe that cannot run then has nothing to fall back
 on and does fail.
 
+### Docker access for the ssh user
+
+The docker socket is root-owned and group `docker`, so an ssh user outside that
+group gets this from every docker call:
+
+```
+permission denied while trying to connect to the docker API at unix:///var/run/docker.sock
+```
+
+Which `command -v docker` does not catch — installed and usable are different
+questions, and the `host` stage now asks both. It reports `docker installed`
+for the binary and `docker usable as <user>` for the socket.
+
+When the socket is out of reach it offers to add the ssh user to the `docker`
+group. That is the fix worth making: group membership is read at login, and
+every step here opens its own ssh session, so the next call picks it up without
+anyone logging out, and no later run needs sudo for docker at all.
+
+Decline it and the run continues through `sudo docker` instead — it works, it
+just asks for a password at each docker step, and the script says so once.
+Neither available is a hard stop with the command to run.
+
+`--uninstall --with-host` removes the user from the group again, but only if
+this script was the one that added it.
+
 ### sudo and the probe
 
 Mounting needs root, so on a worker whose ssh user is not root and whose sudo

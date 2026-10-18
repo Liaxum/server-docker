@@ -61,6 +61,12 @@ ONLY_STAGE=""
 # Filled in by the mesh stage: the address headscale actually handed out.
 WORKER_MESH_ADDR=""
 
+# How to invoke docker on the worker. "docker present" is not the same as
+# "docker usable": the socket is root-owned and group-docker, so an ssh user
+# who is not in that group gets "permission denied while trying to connect to
+# the docker API" from every call. Resolved once, by asking.
+WORKER_DOCKER="docker"
+
 RED=$'\033[31m'; YELLOW=$'\033[33m'; GREEN=$'\033[32m'; BOLD=$'\033[1m'; OFF=$'\033[0m'
 [[ -t 1 ]] || { RED=""; YELLOW=""; GREEN=""; BOLD=""; OFF=""; }
 
@@ -282,7 +288,7 @@ worker_mesh_addr() {
 }
 
 swarm_state() {
-  host_eval "docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null" | tr -d '[:space:]' || true
+  host_eval "$WORKER_DOCKER info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null" | tr -d '[:space:]' || true
 }
 
 # ---------------------------------------------------------------- stages ---
@@ -346,7 +352,9 @@ ensure_hostname() {
 }
 
 ensure_docker() {
-  host_eval 'command -v docker >/dev/null 2>&1' && { skip "docker present"; return; }
+  # Only that it is installed; whether this user may use it is
+  # ensure_docker_access's job, and the two fail for different reasons.
+  host_eval 'command -v docker >/dev/null 2>&1' && { skip "docker installed"; return; }
 
   may_fix "docker is not installed on $WHERE. Install it (runs Docker's installer: curl -fsSL https://get.docker.com | sh)?" \
     || { blocker "docker is not installed on $WHERE. Install it, or re-run with --with-host-setup."; return; }
@@ -393,10 +401,58 @@ ensure_nfs_module() {
   record "loaded_nfs_module"
 }
 
+# Decide how to reach the docker socket on the worker, without changing
+# anything. Plain docker if the ssh user can already use it, sudo if it can;
+# the caller decides what to do when neither works.
+resolve_worker_docker() {
+  if host_eval 'docker info >/dev/null 2>&1'; then
+    WORKER_DOCKER="docker"
+    return 0
+  fi
+  if host_eval 'sudo -n docker info >/dev/null 2>&1'; then
+    WORKER_DOCKER="sudo docker"
+    return 0
+  fi
+  return 1
+}
+
+# The group is the fix worth making: adding the ssh user to it once means no
+# sudo for any later run. Group membership is read at login, and every
+# host_eval/host_run opens its own ssh session, so the next call picks it up
+# without the operator logging out.
+ensure_docker_access() {
+  if resolve_worker_docker && [[ "$WORKER_DOCKER" == docker ]]; then
+    skip "docker usable as $(host_eval 'id -un' 2>/dev/null | tr -d '[:space:]')"
+    return
+  fi
+
+  local user
+  user="$(host_eval 'id -un' 2>/dev/null | tr -d '[:space:]')" || user=""
+
+  if may_fix "${user:-the ssh user} on $WHERE cannot reach the docker socket. Add it to the 'docker' group?"; then
+    host_run "sudo usermod -aG docker ${user:?could not read the ssh user name}"
+    record "added_to_docker_group $user"
+    # Fresh ssh session, so the new group applies.
+    if resolve_worker_docker && [[ "$WORKER_DOCKER" == docker ]]; then
+      ok "added $user to the docker group"
+      return
+    fi
+  fi
+
+  # Not fatal while sudo works -- it only costs prompts.
+  if resolve_worker_docker; then
+    warn "using 'sudo docker' on $WHERE. It works, but every docker step will ask for a password; adding ${user:-the ssh user} to the docker group avoids that."
+    return
+  fi
+
+  blocker "${user:-the ssh user} on $WHERE cannot use docker, directly or through sudo. Add it to the docker group (sudo usermod -aG docker ${user:-<user>}), or use an ssh user that is already root."
+}
+
 stage_host() {
   info "host prerequisites on $WHERE"
   ensure_hostname
   ensure_docker
+  ensure_docker_access
   ensure_nfs_client
   ensure_nfs_module
   ok "$WHERE ready"
@@ -654,7 +710,7 @@ EOF
 # successful join proves nothing, and --manager is not needed to catch it.
 check_remote_managers() {
   local addrs
-  addrs="$(host_eval "docker info --format '{{range .Swarm.RemoteManagers}}{{.Addr}} {{end}}' 2>/dev/null")" || addrs=""
+  addrs="$(host_eval "$WORKER_DOCKER info --format '{{range .Swarm.RemoteManagers}}{{.Addr}} {{end}}' 2>/dev/null")" || addrs=""
   addrs="$(printf '%s' "$addrs" | tr -s '[:space:]' ' ')"
   [[ -n "${addrs// /}" ]] || return 0        # older daemons omit the field
 
@@ -698,7 +754,7 @@ stage_swarm() {
   state="$(swarm_state)"
   if [[ "$state" == active ]]; then
     local addr
-    addr="$(host_eval "docker info --format '{{.Swarm.NodeAddr}}' 2>/dev/null" | tr -d '[:space:]')" || addr=""
+    addr="$(host_eval "$WORKER_DOCKER info --format '{{.Swarm.NodeAddr}}' 2>/dev/null" | tr -d '[:space:]')" || addr=""
     if [[ -n "$addr" && "$addr" != "$WORKER_MESH_ADDR" ]]; then
       warn "$WHERE is in a swarm advertising $addr rather than its mesh address $WORKER_MESH_ADDR, so its overlay traffic does not use the mesh. Run --leave, then this script again."
     else
@@ -722,7 +778,7 @@ stage_swarm() {
   # --advertise-addr is the whole point: without it docker picks whatever
   # interface it likes, usually the LAN or public one, and the overlay leaves
   # the mesh even though the join itself went over it.
-  host_run "docker swarm join --token $token --advertise-addr $WORKER_MESH_ADDR $MESH_ADDR:2377"
+  host_run "$WORKER_DOCKER swarm join --token $token --advertise-addr $WORKER_MESH_ADDR $MESH_ADDR:2377"
   record "swarm_joined"
   ok "joined the swarm as $WORKER_HOSTNAME, advertising $WORKER_MESH_ADDR"
   check_remote_managers || true
@@ -883,8 +939,8 @@ EOF
 # redeploy and keeps failing. Detected by driver option rather than by name, so
 # a worker's own unrelated local volumes are never in the list.
 cached_nfs_volumes() {
-  host_eval 'docker volume ls -q 2>/dev/null | while read -r v; do
-    o=$(docker volume inspect -f "{{if .Options}}{{index .Options \"type\"}}{{end}}" "$v" 2>/dev/null) || o=""
+  host_eval "D=\"$WORKER_DOCKER\"; "'$D volume ls -q 2>/dev/null | while read -r v; do
+    o=$($D volume inspect -f "{{if .Options}}{{index .Options \"type\"}}{{end}}" "$v" 2>/dev/null) || o=""
     [ "$o" = nfs ] && printf "%s\n" "$v"
   done' 2>/dev/null | sed '/^$/d' || true
 }
@@ -911,7 +967,7 @@ present_images() {
   want="$(stack_images)" || want=""
   [[ -n "$want" ]] || return 0
   for img in $want; do
-    host_eval "docker image inspect $img >/dev/null 2>&1" && printf '%s\n' "$img"
+    host_eval "$WORKER_DOCKER image inspect $img >/dev/null 2>&1" && printf '%s\n' "$img"
   done
   return 0
 }
@@ -946,6 +1002,13 @@ undo_host() {
 
   if grep -qx 'loaded_nfs_module' <<< "$state"; then
     host_run 'sudo rm -f /etc/modules-load.d/nfs-client.conf' || true
+  fi
+
+  # Before docker itself goes, while the group still exists.
+  local guser
+  guser="$(printf '%s\n' "$state" | grep -m1 '^added_to_docker_group ' | cut -d' ' -f2-)" || true
+  if [[ -n "$guser" ]]; then
+    host_run "sudo gpasswd -d $guser docker" || true
   fi
 
   # Last of the packages: removing docker earlier would take the daemon out
@@ -1011,7 +1074,7 @@ do_uninstall() {
   # 1. Leave the swarm first, so nothing is scheduled onto a node whose
   #    volumes are about to disappear.
   if [[ "$state" == active ]]; then
-    host_run 'docker swarm leave --force' || true
+    host_run "$WORKER_DOCKER swarm leave --force" || true
     (( DRY_RUN )) || ok "left the swarm"
   else
     skip "not in a swarm"
@@ -1039,7 +1102,7 @@ do_uninstall() {
     if (( DRY_RUN )); then
       printf '    would run%s: docker volume rm %s\n' "${SSH_TARGET:+ on $SSH_TARGET}" "$v"
     else
-      host_eval "docker volume rm $v >/dev/null 2>&1" && ok "removed volume $v" \
+      host_eval "$WORKER_DOCKER volume rm $v >/dev/null 2>&1" && ok "removed volume $v" \
         || warn "could not remove volume $v; something may still be using it"
     fi
   done
@@ -1050,7 +1113,7 @@ do_uninstall() {
     if (( DRY_RUN )); then
       printf '    would run%s: docker image rm %s\n' "${SSH_TARGET:+ on $SSH_TARGET}" "$img"
     else
-      host_eval "docker image rm $img >/dev/null 2>&1" && ok "removed image $img" \
+      host_eval "$WORKER_DOCKER image rm $img >/dev/null 2>&1" && ok "removed image $img" \
         || skip "$img is still in use, or already gone"
     fi
   done
@@ -1086,6 +1149,11 @@ load_env_file "$WORKER_ENV_FILE"
 load_env_file "$ENV_FILE"
 
 warn_if_sudo_prompts
+
+# --from/--only can skip the host stage, which is what normally settles this,
+# so resolve it up front too. Failure is left to the stage that needs docker to
+# report, with the context of what it was trying to do.
+(( DRY_RUN )) || resolve_worker_docker || true
 
 if (( LEAVE || UNINSTALL )); then
   do_uninstall
