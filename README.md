@@ -711,6 +711,67 @@ Changing the volume's `device` or `o` options is different: Docker stores
 those on the volume at creation and ignores the updated stack file, so the
 volume has to be removed on every node first (see below).
 
+### `Core failed to validate Periphery public key`
+
+```json
+{ "name": "liaxum-mini",
+  "err": { "error": "Core failed to validate Periphery public key",
+           "trace": ["Ensure public key matches configured Periphery Public Key",
+                     "MCowBQYDK2Vu... is invalid"] } }
+```
+
+Periphery's private key defaults to `file:/config/keys/periphery.key` in the
+container image, and it generates a fresh keypair there whenever that file is
+missing, then registers the public half with core, which records it against
+that one server. So the keys directory is per-agent identity, not shared state
+— and `agent` runs `mode: global`.
+
+Pointing every agent at the shared NFS mount therefore had every node writing
+one keypair into one directory. Whichever agent regenerated last took the
+others' identity with it, and core rejected the rest. It only looked fine while
+there was a single node.
+
+`apps/monitor/compose.yml` now gives each agent a node-local `agent-keys`
+volume for its own keys and mounts the share read-only at `/config/core`
+purely to read `core.pub`. Redeploying is not enough on its own, because both
+sides still hold stale state:
+
+```bash
+# 1. the share has periphery keys that no longer belong to anyone.
+#    core.pub is core's and must stay -- the agents still read it, and
+#    periphery writes that path itself if it ever finds it missing.
+docker exec nfs-server ls -la /shared/monitor-keys
+docker exec nfs-server sh -c 'cd /shared/monitor-keys && ls | grep -v "^core.pub$"'
+#    remove only what that last command listed
+
+# 2. drop the stale periphery keypair each agent cached, on every node
+docker volume rm monitor_agent-keys    # on each node; the service must be down
+
+# 3. redeploy; each agent now generates its own keypair in its own volume
+docker stack deploy -c apps/monitor/compose.yml monitor
+
+# 4. let core record the new keys, then confirm
+docker service logs --tail 50 monitor_agent
+```
+
+Step 4 is the one that is easy to miss: core keeps the old public key on the
+`Server` resource, so a correctly-working agent stays rejected until that key
+is replaced. Onboarding keys are reusable and carry an option for exactly this
+— permission to update the keys on an existing server. Either
+
+- turn that option on for the onboarding key in `KOMODO_ONBOARDING_KEY` and let
+  each agent's new key overwrite what core has, which is the whole-cluster fix
+  in one step; or
+- per server, Servers → `<server>` → Config → Periphery Public Key: empty it and
+  let the agent re-onboard.
+
+A note on the key in the error, in case it sends you down the wrong path: it
+decodes to an **X25519** key (OID 1.3.101.110), not the **Ed25519**
+(1.3.101.112) that core advertises as its own public key. Both are correct.
+Periphery's key is the static key of the handshake it authenticates with, and
+it is not the same algorithm as core's — so a key type that does not match
+core's is not the fault, and there is nothing to fix there.
+
 ### Purge cached NFS volumes across the cluster
 
 After any change to the `keys` volume definition:
