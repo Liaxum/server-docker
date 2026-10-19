@@ -17,7 +17,7 @@ centralized NFS persistent storage and a Traefik reverse proxy.
 | `apps/nfs/compose.yml` | **standalone compose** on the VPS | exports `/shared` over Tailscale |
 | `apps/filebrowser/compose.yml` | stack `files` | web UI on the shared volume |
 | `apps/monitor/compose.yml` | stack `monitor` | Komodo core, Mongo, global agents, MCP |
-| `apps/printcast/compose.yml` | **standalone compose** on `liaxum-mini` | live stream of the 3D printer, with status overlay |
+| `apps/printcast/compose.yml` | **standalone compose** on `liaxum-mini` | BambuBoard + OBS: live stream of the 3D printer with telemetry |
 | `scripts/bootstrap.sh` | — | brings the manager up from nothing |
 | `scripts/join-worker.sh` | — | adds a worker to the mesh, then the swarm |
 
@@ -761,13 +761,14 @@ the image pulls with it.
 
 ## Printer stream (liaxum-mini)
 
-`apps/printcast/` live-streams the Bambu Lab X2D on the mini PC's LAN, with
-a status card (state, progress, layers, time left, temperatures) read from
-the printer's MQTT:
+`apps/printcast/` live-streams the Bambu Lab X2D on the mini PC's LAN.
+[BambuBoard](https://github.com/t0nyz0/BambuBoard) holds the printer's camera
+and MQTT connections and composites the feed and the print telemetry
+(progress, time left, temperatures for both nozzles, AMS, fans) into one page;
+OBS captures that page and streams it:
 
 ```
-printer --rtsps:322--> camera (go2rtc) --rtsp:8554--> obs --> Twitch / YouTube
-printer --mqtts:8883-> overlay --http:8080 (browser source)--^
+printer --rtsps:322 + mqtts:8883--> bambuboard --http:8080 /live--> obs --> Twitch / YouTube
 ```
 
 It is **standalone compose**, like `apps/nfs`, not a swarm stack: swarm can
@@ -775,18 +776,22 @@ neither bind a port to one address (see [Pi-hole and port 53](#pi-hole-and-port-
 nor pass `/dev/dri` or `shm_size` to a service, and this needs all three. The
 UIs bind to the mini's mesh address only, and nothing goes through Traefik.
 
+**BambuBoard has no login.** Its setup, layout and streaming controls are
+open to anyone who can reach port 8080, so the mesh-only binding is the access
+control. Do not publish it through Traefik.
+
 ### On the printer first
 
-1. **LAN Only Liveview** — Settings → General. Without it the X2D reports its
-   stream URL as `disable`, serves no RTSPS, and go2rtc's connection is
-   refused. This is separate from LAN Only Mode; Bambu Cloud and Handy keep
-   working.
+1. **LAN Only Liveview**: Settings → General. Without it the X2D reports its
+   stream URL as `disable` and serves no RTSPS, so the camera widget stays
+   black while telemetry works. This is separate from LAN Only Mode; Bambu
+   Cloud and Handy keep working.
 2. Note the **IP**, the **access code** (network settings) and the **serial
    number**. Give the printer a DHCP reservation.
-3. If the overlay logs `CONNACK 5` with the right access code, or the
-   connection is reset, the firmware is refusing third-party MQTT: turn on
-   LAN Only Mode and Developer Mode. Behaviour here has changed across
-   firmware releases, so try without them first.
+3. If BambuBoard's Connect panel shows MQTT refused with the right access
+   code, the firmware is refusing third-party MQTT: turn on LAN Only Mode and
+   Developer Mode. This behaviour has changed across firmware releases, so try
+   without them first.
 
 ### Deploy
 
@@ -803,11 +808,23 @@ with the same variables in the Stack's environment. Every required variable
 uses `:?`, so a missing one fails the deploy instead of starting something
 half-configured.
 
-The OBS image is **built**, not pulled (`apps/printcast/obs/Dockerfile`): no
-maintained OBS image exists, so it is LinuxServer's Selkies desktop with OBS
-from the OBS project's PPA — the Ubuntu base because Debian's OBS package
-ships without the browser source the overlay needs. The first build takes a
-few minutes; `docker compose build --pull` picks up base and OBS updates.
+The printer is defined by the stack environment, not BambuBoard's Setup
+page: BambuBoard re-applies the `BAMBUBOARD_PRINTER_*` variables over its
+saved config on every start, so an edit made in Setup lasts only until the
+next restart. Change `.env` instead.
+
+`BAMBUBOARD_PRINTER_TYPE` is pinned to `H2D`. BambuBoard has no X2D profile
+and maps the X2D to its H2D one, the nearest dual-nozzle model, but the image
+defaults to `X1`, which hides the second-nozzle and AMS widgets. The
+maintainer tests on an X1C and an H2D only, so some H2D widgets may not match
+the X2D exactly. Check each one before going live.
+
+The OBS image is **built**, not pulled (`apps/printcast/obs/Dockerfile`).
+Nobody publishes a maintained OBS image, so this one is LinuxServer's Selkies
+desktop with OBS installed from the OBS project's PPA. The Ubuntu base is
+deliberate: Debian's OBS package ships without the browser source this setup
+depends on. The first build takes a few minutes; `docker compose build --pull`
+picks up base and OBS updates.
 
 `/dev/dri` is passed through for VAAPI encoding. On a host without it, remove
 the `devices:` entry, since compose refuses to create the container otherwise,
@@ -817,34 +834,31 @@ and expect software x264 to use most of a mini PC's CPU at 1080p30.
 
 | | URL (from any mesh node) | What it proves |
 |---|---|---|
-| camera | `http://<mini>:1984` → `printer` → stream | go2rtc reaches the printer and the liveview setting is on |
-| overlay | `http://<mini>:8080/state.json` | `"online": true` means MQTT is connected and reporting |
+| BambuBoard | `http://<mini>:8080/setup#connect` | MQTT, telemetry and camera status, each reported separately |
+| broadcast | `http://<mini>:8080/live` | the published layout, i.e. exactly what OBS will capture |
 | OBS | `https://<mini>:3001` | the desktop; self-signed cert, basic auth `OBS_USER` / `OBS_PASSWORD` |
 
-### Setting up the scene in OBS
+### Setting up the stream
 
-Inside the compose network the services are reached by name:
+1. In BambuBoard, open **Layout**, start from the `default-h2d` template,
+   arrange it and **Publish to /live**. Note the scene size shown under the
+   Live preview.
+2. In OBS, set **Settings → Video → Base (Canvas) Resolution** to that size.
+3. Add one **Browser** source, URL `http://bambuboard:8080/live` (the
+   service name, inside the compose network), sized to the canvas. Use
+   `/live?transparent=1` to layer it over other sources.
+4. **Settings → Output**: a VAAPI H.264 encoder if `/dev/dri` is passed (x264
+   otherwise). **Settings → Stream**: the service and stream key. Both persist
+   in the `printcast_obs-config` volume.
 
-- **Media Source**, *Local File* unchecked, input `rtsp://camera:8554/printer`,
-  *Restart playback when source becomes active* on. go2rtc keeps one
-  connection to the printer however many viewers it has, so the OBS source
-  and the go2rtc page count as a single client on the printer.
-- **Browser** source, URL `http://overlay:8080/`, the size of the canvas
-  (e.g. 1920×1080). The page is transparent apart from the card.
-  `?corner=top-left|top-right|bottom-left|bottom-right` moves it;
-  `?idle=hide` hides it whenever the printer is not printing.
-- **Settings → Output**, a VAAPI H.264 encoder if `/dev/dri` is passed
-  (x264 otherwise), and the stream key under **Settings → Stream**. Both persist in the
-  `printcast_obs-config` volume.
+Re-publishing in BambuBoard updates `/live`, and so the stream, without
+touching OBS.
 
-### What the overlay does not show
-
-Temperatures come from the printer's flat `nozzle_temper` / `bed_temper` /
-`chamber_temper` fields only. Dual-nozzle printers can also report
-per-extruder temperatures under `print.device` in a packed form Bambu has not
-documented, and the overlay leaves out a reading it cannot check rather than
-risk showing a wrong one. If the X2D reports no flat nozzle temperature, that
-line simply does not appear.
+BambuBoard can also stream to YouTube by itself (Live → *Direct YouTube
+streaming*), with no OBS involved. It is beta, YouTube only, encodes on the
+CPU with no hardware acceleration, and sends silent audio. OBS is here for
+Twitch, the iGPU encoder and audio; the built-in option is a fallback, not a
+replacement.
 
 ## Design decisions
 

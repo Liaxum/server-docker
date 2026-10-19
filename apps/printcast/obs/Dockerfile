@@ -5,9 +5,9 @@
 # years stale. Their base image is maintained, so the app is all this adds.
 #
 # Ubuntu, not the Debian base, because of where OBS comes from. The OBS
-# project's own PPA builds include the browser source the overlay depends on;
-# Debian's obs-studio package is built without it, and the overlay would have
-# nothing to render into.
+# project's own PPA builds include the browser source that captures
+# BambuBoard's /live page; Debian's obs-studio package is built without it,
+# and OBS would have no way to show the printer at all.
 FROM ghcr.io/linuxserver/baseimage-selkies:ubuntunoble
 
 ENV TITLE="OBS Studio"
