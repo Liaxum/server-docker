@@ -1,0 +1,119 @@
+<!doctype html>
+<!--
+  OBS browser source: http://overlay:8080/  (the size of the scene, e.g. 1920x1080)
+
+  The background is transparent so the camera shows through; the card sits in
+  a corner. ?corner=top-left|top-right|bottom-left|bottom-right moves it, and
+  ?idle=hide removes it entirely while the printer is not printing.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Printer overlay</title>
+<style>
+  :root {
+    --card: rgba(12, 14, 18, 0.78);
+    --text: #f2f4f7;
+    --muted: #a3acb9;
+    --track: rgba(255, 255, 255, 0.16);
+    --accent: #22c55e;
+    --warn: #f59e0b;
+    --bad: #ef4444;
+  }
+  html, body { margin: 0; background: transparent; overflow: hidden; }
+  body {
+    font: 600 22px/1.25 "Inter", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+  }
+  #card {
+    position: absolute;
+    width: 460px;
+    padding: 18px 22px;
+    border-radius: 14px;
+    background: var(--card);
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.35);
+    transition: opacity 0.4s;
+  }
+  #card.hidden { opacity: 0; }
+  .bottom-left { left: 40px; bottom: 40px; }
+  .bottom-right { right: 40px; bottom: 40px; }
+  .top-left { left: 40px; top: 40px; }
+  .top-right { right: 40px; top: 40px; }
+  .row { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; }
+  #name { font-size: 18px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #state { font-size: 26px; }
+  #percent { font-size: 34px; }
+  .bar { height: 10px; margin: 12px 0 10px; border-radius: 5px; background: var(--track); overflow: hidden; }
+  #fill { height: 100%; width: 0; background: var(--accent); transition: width 1s linear; }
+  .meta { font-size: 18px; color: var(--muted); }
+  #temps { margin-top: 8px; font-size: 18px; color: var(--muted); display: flex; flex-wrap: wrap; column-gap: 20px; }
+  #temps span { white-space: nowrap; }
+  .paused #fill { background: var(--warn); }
+  .failed #fill, .offline #fill { background: var(--bad); }
+</style>
+</head>
+<body>
+<div id="card" class="hidden">
+  <div id="name"></div>
+  <div class="row"><span id="state">Connecting…</span><span id="percent"></span></div>
+  <div class="bar"><div id="fill"></div></div>
+  <div class="row meta"><span id="layers"></span><span id="eta"></span></div>
+  <div id="temps"></div>
+</div>
+<script>
+  const params = new URLSearchParams(location.search);
+  const card = document.getElementById("card");
+  const corners = ["top-left", "top-right", "bottom-left", "bottom-right"];
+  card.classList.add(corners.includes(params.get("corner")) ? params.get("corner") : "bottom-left");
+  const hideIdle = params.get("idle") === "hide";
+  const $ = (id) => document.getElementById(id);
+
+  function duration(min) {
+    const h = Math.floor(min / 60), m = min % 60;
+    return h ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m`;
+  }
+
+  function render(s) {
+    const active = ["PREPARE", "SLICING", "RUNNING", "PAUSE"].includes(s.state);
+    card.classList.toggle("hidden", hideIdle && !active);
+    card.classList.toggle("paused", s.state === "PAUSE");
+    card.classList.toggle("failed", s.state === "FAILED");
+    card.classList.toggle("offline", !s.online);
+
+    $("state").textContent = s.online ? (s.label || "Waiting for printer") : "Printer offline";
+    $("name").textContent = s.name || "";
+    const pct = s.percent ?? 0;
+    $("percent").textContent = s.online && s.percent != null ? `${pct}%` : "";
+    $("fill").style.width = `${s.state === "FINISH" ? 100 : pct}%`;
+
+    $("layers").textContent = s.total_layers ? `Layer ${s.layer ?? 0} / ${s.total_layers}` : "";
+    if (active && s.remaining_min != null) {
+      const done = new Date(Date.now() + s.remaining_min * 60000);
+      const at = done.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+      $("eta").textContent = `${duration(s.remaining_min)} left · ${at}`;
+    } else {
+      $("eta").textContent = "";
+    }
+
+    $("temps").replaceChildren(...Object.entries(s.temps || {}).map(([name, t]) => {
+      const el = document.createElement("span");
+      const target = t.target ? ` / ${t.target}` : "";
+      el.textContent = `${name[0].toUpperCase()}${name.slice(1)} ${t.current}${target}°C`;
+      return el;
+    }));
+  }
+
+  async function poll() {
+    try {
+      const res = await fetch("state.json", { cache: "no-store" });
+      render(await res.json());
+    } catch {
+      render({ online: false });
+    }
+    setTimeout(poll, 1000);
+  }
+  poll();
+</script>
+</body>
+</html>

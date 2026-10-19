@@ -17,6 +17,7 @@ centralized NFS persistent storage and a Traefik reverse proxy.
 | `apps/nfs/compose.yml` | **standalone compose** on the VPS | exports `/shared` over Tailscale |
 | `apps/filebrowser/compose.yml` | stack `files` | web UI on the shared volume |
 | `apps/monitor/compose.yml` | stack `monitor` | Komodo core, Mongo, global agents, MCP |
+| `apps/printcast/compose.yml` | **standalone compose** on `liaxum-mini` | live stream of the 3D printer, with status overlay |
 | `scripts/bootstrap.sh` | — | brings the manager up from nothing |
 | `scripts/join-worker.sh` | — | adds a worker to the mesh, then the swarm |
 
@@ -757,6 +758,93 @@ sudo systemctl restart systemd-resolved
 `/etc/resolv.conf` must then point somewhere real rather than at `127.0.0.53`,
 or the host loses DNS the moment Pi-hole is down — which takes Tailscale and
 the image pulls with it.
+
+## Printer stream (liaxum-mini)
+
+`apps/printcast/` live-streams the Bambu Lab X2D on the mini PC's LAN, with
+a status card (state, progress, layers, time left, temperatures) read from
+the printer's MQTT:
+
+```
+printer --rtsps:322--> camera (go2rtc) --rtsp:8554--> obs --> Twitch / YouTube
+printer --mqtts:8883-> overlay --http:8080 (browser source)--^
+```
+
+It is **standalone compose**, like `apps/nfs`, not a swarm stack: swarm can
+neither bind a port to one address (see [Pi-hole and port 53](#pi-hole-and-port-53))
+nor pass `/dev/dri` or `shm_size` to a service, and this needs all three. The
+UIs bind to the mini's mesh address only, and nothing goes through Traefik.
+
+### On the printer first
+
+1. **LAN Only Liveview** — Settings → General. Without it the X2D reports its
+   stream URL as `disable`, serves no RTSPS, and go2rtc's connection is
+   refused. This is separate from LAN Only Mode; Bambu Cloud and Handy keep
+   working.
+2. Note the **IP**, the **access code** (network settings) and the **serial
+   number**. Give the printer a DHCP reservation.
+3. If the overlay logs `CONNACK 5` with the right access code, or the
+   connection is reset, the firmware is refusing third-party MQTT: turn on
+   LAN Only Mode and Developer Mode. Behaviour here has changed across
+   firmware releases, so try without them first.
+
+### Deploy
+
+On `liaxum-mini`, from a checkout of this repo:
+
+```bash
+cd apps/printcast
+cp .env.example .env      # MINI_MESH_ADDR, BAMBU_*, OBS_PASSWORD
+docker compose up -d --build
+```
+
+Or as a Komodo Stack on the `liaxum-mini` server pointing at `apps/printcast`,
+with the same variables in the Stack's environment. Every required variable
+uses `:?`, so a missing one fails the deploy instead of starting something
+half-configured.
+
+The OBS image is **built**, not pulled (`apps/printcast/obs/Dockerfile`): no
+maintained OBS image exists, so it is LinuxServer's Selkies desktop with OBS
+from the OBS project's PPA — the Ubuntu base because Debian's OBS package
+ships without the browser source the overlay needs. The first build takes a
+few minutes; `docker compose build --pull` picks up base and OBS updates.
+
+`/dev/dri` is passed through for VAAPI encoding. On a host without it, remove
+the `devices:` entry, since compose refuses to create the container otherwise,
+and expect software x264 to use most of a mini PC's CPU at 1080p30.
+
+### Check each hop, in order
+
+| | URL (from any mesh node) | What it proves |
+|---|---|---|
+| camera | `http://<mini>:1984` → `printer` → stream | go2rtc reaches the printer and the liveview setting is on |
+| overlay | `http://<mini>:8080/state.json` | `"online": true` means MQTT is connected and reporting |
+| OBS | `https://<mini>:3001` | the desktop; self-signed cert, basic auth `OBS_USER` / `OBS_PASSWORD` |
+
+### Setting up the scene in OBS
+
+Inside the compose network the services are reached by name:
+
+- **Media Source**, *Local File* unchecked, input `rtsp://camera:8554/printer`,
+  *Restart playback when source becomes active* on. go2rtc keeps one
+  connection to the printer however many viewers it has, so the OBS source
+  and the go2rtc page count as a single client on the printer.
+- **Browser** source, URL `http://overlay:8080/`, the size of the canvas
+  (e.g. 1920×1080). The page is transparent apart from the card.
+  `?corner=top-left|top-right|bottom-left|bottom-right` moves it;
+  `?idle=hide` hides it whenever the printer is not printing.
+- **Settings → Output**, a VAAPI H.264 encoder if `/dev/dri` is passed
+  (x264 otherwise), and the stream key under **Settings → Stream**. Both persist in the
+  `printcast_obs-config` volume.
+
+### What the overlay does not show
+
+Temperatures come from the printer's flat `nozzle_temper` / `bed_temper` /
+`chamber_temper` fields only. Dual-nozzle printers can also report
+per-extruder temperatures under `print.device` in a packed form Bambu has not
+documented, and the overlay leaves out a reading it cannot check rather than
+risk showing a wrong one. If the X2D reports no flat nozzle temperature, that
+line simply does not appear.
 
 ## Design decisions
 

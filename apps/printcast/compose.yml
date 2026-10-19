@@ -1,0 +1,104 @@
+# Standalone compose (NOT a swarm stack), on liaxum-mini only:
+#
+#   cd apps/printcast && cp .env.example .env    # fill it in
+#   docker compose up -d --build
+#
+# or as a Komodo Stack on the liaxum-mini server pointed at this directory,
+# with the same variables in its environment.
+#
+# Live-streams the Bambu Lab X2D on the mini PC's LAN, with a status overlay
+# read from the printer's MQTT:
+#
+#   printer --rtsps:322--> camera (go2rtc) --rtsp:8554--> obs --> Twitch/YouTube
+#   printer --mqtts:8883-> overlay --http:8080 browser source--^
+#
+# Standalone for the same reason as apps/nfs: swarm cannot give a service what
+# this one needs.
+#   - Ports bound to one address. Swarm's port syntax has no host_ip (see
+#     apps/pihole), so every UI here would listen on every interface of the
+#     mini PC -- its LAN included. Standalone compose binds them to the mesh
+#     address and nothing else.
+#   - devices. Swarm services cannot be handed /dev/dri, and without the iGPU
+#     OBS encodes in software, which a mini PC cannot sustain at 1080p30.
+#   - shm_size. Also unsupported by `docker stack deploy`; the browser desktop
+#     OBS is drawn into needs more than the 64 MB default.
+#
+# Nothing here holds state anyone else needs, so it does not touch the NFS
+# share and is not pinned with a placement constraint: it runs wherever
+# `docker compose up` is run, which has to be the mini PC because that is
+# the machine on the printer's LAN.
+name: printcast
+
+x-printer: &printer
+  # Required, with no defaults: there is no value that is right for every
+  # install, and an empty access code fails at the printer with an error that
+  # does not say which variable was missing. ":?" fails the deploy instead.
+  BAMBU_HOST: ${BAMBU_HOST:?set BAMBU_HOST to the printer's LAN address}
+  BAMBU_ACCESS_CODE: ${BAMBU_ACCESS_CODE:?set BAMBU_ACCESS_CODE from the printer's network settings}
+
+services:
+  # One connection to the printer, re-served to everything else. OBS reads it
+  # over plain RTSP inside the compose network, and the web UI on 1984 is
+  # how to check the feed without OBS in the way.
+  camera:
+    image: alexxit/go2rtc:latest
+    restart: unless-stopped
+    environment:
+      <<: *printer
+    volumes:
+      - ./go2rtc.yaml:/config/go2rtc.yaml:ro
+    ports:
+      - "${MINI_MESH_ADDR:?set MINI_MESH_ADDR to liaxum-mini's Tailscale address}:${CAMERA_PORT:-1984}:1984"
+
+  # Subscribes to the printer's MQTT reports and serves them as an OBS browser
+  # source. Standard library only, so it runs on the stock image with the
+  # script bind-mounted and there is nothing to build or pip install.
+  overlay:
+    image: python:3.13-alpine
+    restart: unless-stopped
+    command: ["python", "-u", "/app/server.py"]
+    environment:
+      <<: *printer
+      BAMBU_SERIAL: ${BAMBU_SERIAL:?set BAMBU_SERIAL to the printer's serial number}
+    volumes:
+      - ./overlay:/app:ro
+    # It writes nothing, so it gets to run unprivileged on a read-only root.
+    user: "65534:65534"
+    read_only: true
+    ports:
+      # For previewing the overlay in a browser. OBS does not need this; it
+      # reaches the service by name inside the compose network.
+      - "${MINI_MESH_ADDR}:${OVERLAY_PORT:-8080}:8080"
+
+  # OBS Studio in a browser-reachable desktop. See obs/Dockerfile for why it
+  # is built here rather than pulled.
+  obs:
+    build: ./obs
+    image: printcast-obs:local
+    restart: unless-stopped
+    depends_on:
+      - camera
+      - overlay
+    shm_size: "1gb"
+    devices:
+      # The iGPU, for VAAPI encoding. Remove this line on a host without
+      # /dev/dri -- compose refuses to create the container if it is missing.
+      - /dev/dri:/dev/dri
+    environment:
+      - PUID=${OBS_PUID:-1000}
+      - PGID=${OBS_PGID:-1000}
+      - TZ=${TZ:-Europe/Paris}
+      # Basic auth on the desktop. Mesh-only is not the same as trusted: every
+      # node on the tailnet could otherwise drive OBS and read the stream key.
+      - CUSTOM_USER=${OBS_USER:-admin}
+      - PASSWORD=${OBS_PASSWORD:?set OBS_PASSWORD for the OBS desktop}
+    volumes:
+      # Scenes, profiles and the stream key.
+      - obs-config:/config
+    ports:
+      # HTTPS only: the Selkies desktop refuses to run over plain HTTP. The
+      # certificate is self-signed, so the browser will warn once.
+      - "${MINI_MESH_ADDR}:${OBS_PORT:-3001}:3001"
+
+volumes:
+  obs-config:
