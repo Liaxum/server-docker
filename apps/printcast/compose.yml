@@ -17,7 +17,8 @@
 #     apps/pihole), so every UI here would listen on every interface of the
 #     mini PC -- its LAN included. Standalone compose binds them to the mesh
 #     address and nothing else. For BambuBoard that is the only access
-#     control there is: its setup and layout pages have no login.
+#     control on the mesh: its setup and layout pages have no login. The
+#     public route in web.yml adds one.
 #   - devices. Swarm services cannot be handed /dev/dri, and without the iGPU
 #     OBS encodes in software, which a mini PC cannot sustain at 1080p30.
 #   - shm_size. Also unsupported by `docker stack deploy`; the browser desktop
@@ -82,9 +83,12 @@ services:
       # Scenes, profiles and the stream key.
       - obs-config:/config
     ports:
-      # HTTPS only: the Selkies desktop refuses to run over plain HTTP. The
-      # certificate is self-signed, so the browser will warn once.
+      # HTTPS, for direct access over the mesh. The certificate is
+      # self-signed, so the browser will warn once.
       - "${MINI_MESH_ADDR}:${OBS_PORT:-3001}:3001"
+      # Plain HTTP, for web.yml's relay only: Traefik terminates TLS in front
+      # of it. Opened directly, Selkies refuses to run without HTTPS.
+      - "${MINI_MESH_ADDR}:${OBS_HTTP_PORT:-3000}:3000"
 
 volumes:
   bambuboard-data:

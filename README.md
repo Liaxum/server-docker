@@ -18,6 +18,7 @@ centralized NFS persistent storage and a Traefik reverse proxy.
 | `apps/filebrowser/compose.yml` | stack `files` | web UI on the shared volume |
 | `apps/monitor/compose.yml` | stack `monitor` | Komodo core, Mongo, global agents, MCP |
 | `apps/printcast/compose.yml` | **standalone compose** on `liaxum-mini` | BambuBoard + OBS: live stream of the 3D printer with telemetry |
+| `apps/printcast/web.yml` | stack `printcast-web` | publishes BambuBoard and OBS through Traefik |
 | `scripts/bootstrap.sh` | — | brings the manager up from nothing |
 | `scripts/join-worker.sh` | — | adds a worker to the mesh, then the swarm |
 
@@ -774,11 +775,13 @@ printer --rtsps:322 + mqtts:8883--> bambuboard --http:8080 /live--> obs --> Twit
 It is **standalone compose**, like `apps/nfs`, not a swarm stack: swarm can
 neither bind a port to one address (see [Pi-hole and port 53](#pi-hole-and-port-53))
 nor pass `/dev/dri` or `shm_size` to a service, and this needs all three. The
-UIs bind to the mini's mesh address only, and nothing goes through Traefik.
+containers bind to the mini's mesh address only; `web.yml` publishes them
+through Traefik (see [Publishing it](#publishing-it)).
 
 **BambuBoard has no login.** Its setup, layout and streaming controls are
-open to anyone who can reach port 8080, so the mesh-only binding is the access
-control. Do not publish it through Traefik.
+open to anyone who can reach port 8080. On the mesh that port is the only
+gate; on the web, the Traefik route adds basic auth, and refuses to deploy
+without it.
 
 ### On the printer first
 
@@ -853,6 +856,54 @@ and expect software x264 to use most of a mini PC's CPU at 1080p30.
 
 Re-publishing in BambuBoard updates `/live`, and so the stream, without
 touching OBS.
+
+### Publishing it
+
+| | URL | Login |
+|---|---|---|
+| BambuBoard | `https://print.liaxum.fr` | Traefik basic auth, `PRINTCAST_AUTH` |
+| OBS | `https://obs.liaxum.fr` | the desktop's own, `OBS_USER` / `OBS_PASSWORD` |
+
+**Labels on the containers cannot do this.** Traefik runs with
+`--providers.swarm` only, which reads labels off swarm *services*, and these
+containers are standalone; OBS has to be, for `/dev/dri`. So `web.yml` is a
+small swarm stack of two `socat` relays pinned to `liaxum-mini`. They carry
+the Traefik labels, sit on `web-net`, and forward raw TCP to the ports
+`compose.yml` binds on the mesh address:
+
+```
+browser --https--> traefik (VPS) --web-net--> relay (liaxum-mini) --> <mini>:8080 / :3000
+```
+
+Raw TCP is deliberate. WebSockets, which both UIs use, and the Host header,
+which BambuBoard checks before accepting streaming commands, pass through
+untouched.
+
+Deploy it from the manager, once `compose.yml` is up on the mini. `docker
+stack deploy` reads the shell's environment, not a `.env` file:
+
+```bash
+# bcrypt htpasswd line; single quotes, because the hash is full of $
+export PRINTCAST_AUTH='admin:$2y$05$...'   # docker run --rm httpd:alpine htpasswd -nbB admin 'password'
+export MINI_MESH_ADDR=100.64.0.x           # the mini's, not the VPS's
+docker stack deploy -c apps/printcast/web.yml printcast-web
+```
+
+Both are required; the deploy fails without them. `PRINT_SUBDOMAIN`,
+`OBS_SUBDOMAIN` and `DOMAIN` default to `print`, `obs` and `liaxum.fr`; the
+default certificate must cover them, as it does `files.` and `monitor.`.
+
+One CLI quirk shaped `web.yml`, and it matters if you edit it. `docker stack
+deploy` silently skips a `${VAR:?message}` that has another `${...}` after it
+in the same string, so the result interpolates to empty, and it misparses a
+`-` inside the message. That is why the required check on `MINI_MESH_ADDR`
+sits in an `environment:` entry of its own rather than in the relay command.
+
+OBS gets no Traefik middleware because it already asks for a login, and two
+layers of basic auth would contend for the one `Authorization` header. It is
+still a full remote desktop on the internet, holding your stream key. Use a
+long `OBS_PASSWORD`, and remember that Tailscale already reaches it from any
+of your own devices, so the public route is optional.
 
 BambuBoard can also stream to YouTube by itself (Live → *Direct YouTube
 streaming*), with no OBS involved. It is beta, YouTube only, encodes on the

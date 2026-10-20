@@ -1,0 +1,87 @@
+# docker stack deploy -c apps/printcast/web.yml printcast-web
+#
+# Run from the manager, AFTER compose.yml is up on liaxum-mini. Publishes
+# BambuBoard and the OBS desktop through Traefik:
+#
+#   browser --https--> traefik (VPS) --web-net--> relay (liaxum-mini) --> mesh port --> container
+#
+# Why relays and not Traefik labels on the containers themselves: Traefik runs
+# with the swarm provider only, which reads labels off swarm *services*. The
+# containers in compose.yml are standalone -- OBS has to be, for /dev/dri and
+# shm_size, which swarm cannot provide -- so labels on them are never seen.
+# Each relay is a swarm service that carries the labels and forwards raw TCP
+# to the port compose.yml binds on the mini's mesh address. Being plain TCP,
+# it passes WebSockets, which both UIs need, and the Host header, which
+# BambuBoard checks, through untouched.
+#
+# The relays are pinned to the mini so the last hop never leaves the machine.
+#
+# Needs, in the stack environment (the same values as compose.yml where they
+# overlap):
+#   MINI_MESH_ADDR   liaxum-mini's Tailscale address
+#   PRINTCAST_AUTH   htpasswd line for BambuBoard, see "Publishing it" in the README
+services:
+  # BambuBoard has no login of its own, so this route carries one.
+  board:
+    image: alpine/socat:latest
+    command:
+      - "TCP-LISTEN:8080,fork,reuseaddr"
+      - "TCP:${MINI_MESH_ADDR}:${BAMBUBOARD_PORT:-8080}"
+    environment:
+      # Unused by socat; here only so a missing address fails the deploy.
+      # The check cannot sit in the command above: the docker CLI skips a
+      # ":?" that has another ${} after it in the same string, and the relay
+      # would quietly forward to ":8080". Keep ":?" alone in its string, and
+      # keep "-" out of its message, which the CLI also misparses.
+      - MINI_MESH_ADDR=${MINI_MESH_ADDR:?set MINI_MESH_ADDR to the Tailscale address of the mini PC}
+    networks:
+      - web-net
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.hostname == ${MINI_HOSTNAME:-liaxum-mini}
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=web-net"
+        - "traefik.http.routers.printcast.rule=Host(`${PRINT_SUBDOMAIN:-print}.${DOMAIN:-liaxum.fr}`)"
+        - "traefik.http.routers.printcast.entrypoints=websecure"
+        - "traefik.http.routers.printcast.tls=true"
+        - "traefik.http.routers.printcast.middlewares=printcast-auth"
+        # Required. Without it the route would serve BambuBoard's setup and
+        # streaming controls to the whole internet with no login at all.
+        # Interpolated values are not re-scanned by compose, so the hash's
+        # own $ signs need no escaping here -- only in a .env file, which must
+        # single-quote the value.
+        - "traefik.http.middlewares.printcast-auth.basicauth.users=${PRINTCAST_AUTH:?set PRINTCAST_AUTH to an htpasswd line}"
+        - "traefik.http.services.printcast.loadbalancer.server.port=8080"
+
+  # The OBS desktop brings its own basic auth (OBS_USER / OBS_PASSWORD in
+  # compose.yml), so no middleware here: two layers of basic auth would
+  # contend for the one Authorization header.
+  obs:
+    image: alpine/socat:latest
+    command:
+      - "TCP-LISTEN:3000,fork,reuseaddr"
+      - "TCP:${MINI_MESH_ADDR}:${OBS_HTTP_PORT:-3000}"
+    networks:
+      - web-net
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.hostname == ${MINI_HOSTNAME:-liaxum-mini}
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=web-net"
+        - "traefik.http.routers.printcast-obs.rule=Host(`${OBS_SUBDOMAIN:-obs}.${DOMAIN:-liaxum.fr}`)"
+        - "traefik.http.routers.printcast-obs.entrypoints=websecure"
+        - "traefik.http.routers.printcast-obs.tls=true"
+        # The desktop's plain-HTTP port, which LinuxServer intend to sit
+        # behind a TLS proxy: the browser sees Traefik's HTTPS, which is the
+        # secure context Selkies insists on.
+        - "traefik.http.services.printcast-obs.loadbalancer.server.port=3000"
+
+networks:
+  web-net:
+    external: true
