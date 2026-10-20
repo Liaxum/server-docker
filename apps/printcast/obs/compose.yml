@@ -1,4 +1,6 @@
-# Standalone compose (NOT a swarm stack), on liaxum-gaming only:
+# Standalone compose (NOT a swarm stack), on liaxum-gaming only. Deploy it as
+# a Komodo Stack on the liaxum-gaming server with "Run Build" on (see
+# "Deploying from Komodo" in the README), or by hand:
 #
 #   cd apps/printcast/obs && cp .env.example .env    # fill it in
 #   docker compose up -d --build
@@ -12,13 +14,46 @@
 # BambuBoard and how the relay reaches it. Nothing is published on the host:
 # the only way in is the Traefik route.
 #
+# Self-contained on purpose: the image is defined inline below rather than in
+# a Dockerfile beside it, because a Komodo Stack written in the UI is a single
+# compose file on disk, with no build context to hold one.
+#
 # Host prerequisite: the NVIDIA driver and the NVIDIA Container Toolkit, with
 # Docker configured to use it. See "OBS on the gaming PC" in the README.
 name: printcast-obs
 
 services:
   obs:
-    build: .
+    build:
+      # OBS in LinuxServer's Selkies desktop. Built rather than pulled because
+      # no maintained OBS image exists: LinuxServer publish none, and the
+      # most-pulled one on Docker Hub was last pushed in 2019. Their base is
+      # rebuilt weekly, so OBS is all this adds.
+      #
+      # Ubuntu, because OBS comes from the OBS project's PPA: its builds include
+      # the browser source that captures BambuBoard, and Ubuntu's and Debian's
+      # own obs-studio packages are built without it.
+      #
+      # No GPU drivers: the NVIDIA Container Toolkit mounts the host driver's
+      # libraries in at start, NVENC's among them, so they always match the
+      # running kernel module.
+      #
+      # The autostart line is what the base image launches once the desktop
+      # is up. --disable-shutdown-check because the container is stopped by
+      # signal, which OBS counts as a crash, and the safe-mode prompt it then
+      # opens on every start would sit in front of the scene.
+      dockerfile_inline: |
+        FROM ghcr.io/linuxserver/baseimage-selkies:ubuntunoble
+        ENV TITLE="OBS Studio"
+        RUN apt-get update && \
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              gpg-agent software-properties-common && \
+            add-apt-repository -y ppa:obsproject/obs-studio && \
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              obs-studio && \
+            apt-get purge -y --auto-remove gpg-agent software-properties-common && \
+            rm -rf /var/lib/apt/lists/* /tmp/*
+        RUN echo "obs --disable-shutdown-check" > /defaults/autostart
     image: printcast-obs:local
     # Fixed, because the relay addresses it by this name across web-net.
     container_name: printcast-obs
@@ -28,9 +63,8 @@ services:
       resources:
         reservations:
           devices:
-            # The toolkit mounts the host driver's libraries in; the base
-            # image already asks for every driver capability, NVENC's "video"
-            # and OpenGL's "graphics" included.
+            # The base image already asks for every driver capability,
+            # NVENC's "video" and OpenGL's "graphics" included.
             - driver: nvidia
               count: all
               capabilities: [gpu]

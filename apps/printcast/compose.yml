@@ -1,10 +1,12 @@
-# docker stack deploy -c apps/printcast/compose.yml printcast
-#
-# Run from the manager with the variables in the shell environment (stack
-# deploy does not read .env files):
+# Swarm stack. Deploy it as a Komodo Stack named exactly "printcast", targeting
+# the Swarm resource (see "Deploying from Komodo" in the README), or by hand
+# from the manager:
 #
 #   set -a; . apps/printcast/stack.env; set +a    # from stack.env.example
 #   docker stack deploy -c apps/printcast/compose.yml printcast
+#
+# The stack name is load-bearing: it makes the service's DNS name
+# printcast_bambuboard, which OBS's Browser source points at.
 #
 # Live-streams the Bambu Lab X2D. BambuBoard runs next to the printer on the
 # mini PC; OBS runs on the gaming PC for its NVIDIA encoder, and captures

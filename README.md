@@ -823,38 +823,92 @@ The toolkit mounts the host driver's libraries into the container at start,
 NVENC's `libnvidia-encode` among them, so the image carries no GPU drivers.
 They always match the running kernel module, which a baked-in copy would not.
 
-The image is **built**, not pulled (`apps/printcast/obs/Dockerfile`). Nobody
+The image is **built**, not pulled. Its definition is inline in
+`apps/printcast/obs/compose.yml` (`dockerfile_inline`), not a separate
+Dockerfile, because a Komodo Stack written in the UI is one compose file on
+disk with no build context beside it. Nobody
 publishes a maintained OBS-with-web-desktop image: the most-pulled one,
 `bandi13/docker-obs`, was last pushed in 2019. So this is LinuxServer's Selkies
 desktop, rebuilt by them weekly, plus OBS from the OBS project's PPA. The PPA
 is the point: its OBS includes the browser source that captures BambuBoard,
 and Ubuntu's and Debian's own packages are built without it. That also rules
 out a stock LinuxServer desktop with OBS installed at start. The first build
-takes a few minutes; `docker compose build --pull` picks up updates.
+takes a few minutes. Redeploying with **Run Build** on, or `docker compose
+build --pull` by hand, picks up updates.
 
-### Deploy
+### Deploying from Komodo
 
-Either order works. The relay resolves `printcast-obs` on every connection,
-so until OBS is up `obs.liaxum.fr` just fails to connect, and it starts
-working as soon as the container exists.
+Both halves are Komodo **Stacks**, and both can be defined in the UI: paste
+the compose file into the Stack's compose editor and fill in its
+Environment. The names matter, so use these exactly:
+
+| | Stack `printcast` | Stack `printcast-obs` |
+|---|---|---|
+| Target | **Swarm** (see below) | **Server** `liaxum-gaming` |
+| Compose file | `apps/printcast/compose.yml` | `apps/printcast/obs/compose.yml` |
+| Run Build | — (ignored for swarm) | **on**, or OBS is never built |
+| Environment | see below | `OBS_PASSWORD = '[[OBS_PASSWORD]]'` |
+
+- **`printcast`** is the stack name `docker stack deploy` uses, and so it
+  sets the DNS name OBS captures: `printcast_bambuboard`. Rename it and the
+  Browser source URL has to change with it.
+- **`printcast-obs`** is the compose project name. It sets the volume that
+  holds the scenes and stream key (`printcast-obs_obs-config`).
+
+**Targeting the swarm.** A Stack deploys to a swarm only through a Komodo
+**Swarm** resource. If there is none yet, create one with `liaxum-vps` as its
+manager server, then set the `printcast` Stack's target to it instead of a
+server. Komodo then runs `docker stack deploy` on the manager, and the
+placement constraints in the file put each service on its node.
+
+**Environment for `printcast`:**
+
+```
+BAMBU_HOST = 192.168.1.50
+BAMBU_SERIAL = [[BAMBU_SERIAL]]
+BAMBU_ACCESS_CODE = [[BAMBU_ACCESS_CODE]]
+PRINTCAST_AUTH = '[[PRINTCAST_AUTH]]'
+```
+
+Define the `[[...]]` ones under **Settings → Variables** with *secret*
+ticked, so they stay out of logs and away from non-admin users.
+`PRINTCAST_AUTH` is a bcrypt htpasswd line:
+`docker run --rm httpd:alpine htpasswd -nbB admin 'password'`.
+
+**Keep the single quotes around `PRINTCAST_AUTH`.** For swarm stacks Komodo
+does not pass an env file to Docker, because `docker stack deploy` cannot
+read one. It writes the Environment to `.env` and **shell-sources** it
+(`set -a && . .env && docker stack deploy …`). Unquoted, the shell expands
+every `$2y`, `$05`… in the hash. That fails silently: the deploy succeeds with
+a mangled hash, and the login never accepts anything. Komodo keeps the quotes
+when it writes the file, and secret interpolation happens before that, so
+`'[[PRINTCAST_AUTH]]'` is safe. The same goes for any other value with `$` or
+spaces in it, `OBS_PASSWORD` included: compose's own `.env` parsing expands
+`$` in unquoted values too.
+
+Either order of deploy works. The relay resolves `printcast-obs` on every
+connection, so until OBS is up `obs.liaxum.fr` just fails to connect, and it
+starts working as soon as the container exists. The certificate Traefik
+serves must cover `print.` and `obs.`, as it does `files.` and `monitor.`.
+
+**UI-defined or Git?** The Stacks can instead point at this repo (Git repo
+mode, the file paths above). The deploy button is the same, but the compose
+files then stay in one place. UI-defined Stacks are copies: an edit here does
+not reach Komodo until someone pastes it again, and an edit in Komodo never
+comes back here. If you go UI-defined, treat the Komodo copy as the live one
+and update this repo from it, or the two drift.
+
+**By hand**, without Komodo:
 
 ```bash
-# 1. On the manager: the stack (stack deploy reads the shell, not a .env file)
+# on the manager: stack deploy reads the shell, not a .env file
 cp apps/printcast/stack.env.example apps/printcast/stack.env   # fill it in
 set -a; . apps/printcast/stack.env; set +a
 docker stack deploy -c apps/printcast/compose.yml printcast
 
-# 2. On liaxum-gaming: OBS
-cd apps/printcast/obs
-cp .env.example .env      # OBS_PASSWORD
-docker compose up -d --build
+# on liaxum-gaming
+cd apps/printcast/obs && cp .env.example .env && docker compose up -d --build
 ```
-
-`PRINTCAST_AUTH` is a bcrypt htpasswd line,
-`docker run --rm httpd:alpine htpasswd -nbB admin 'password'`. Keep it in
-single quotes in `stack.env`: it is sourced by the shell, and the hash is full
-of `$`. The certificate Traefik serves must cover `print.` and `obs.`, as it
-does `files.` and `monitor.`.
 
 The printer is defined by the stack environment, not BambuBoard's Setup
 page: BambuBoard re-applies the `BAMBUBOARD_PRINTER_*` variables over its
