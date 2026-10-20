@@ -875,6 +875,13 @@ ticked, so they stay out of logs and away from non-admin users.
 `PRINTCAST_AUTH` is a bcrypt htpasswd line:
 `docker run --rm httpd:alpine htpasswd -nbB admin 'password'`.
 
+**This needs Komodo 2.1.0 or newer, on core and on the manager's
+periphery.** Komodo 2.0.x drops a swarm Stack's Environment entirely and runs
+`docker stack deploy` with none of it, so the first required variable fails:
+`required variable PRINTCAST_AUTH is missing a value`. The deploy log shows
+which you have. On 2.1+, the *Stack Config* stage's command starts with
+`set -a && . .env &&`; on 2.0 it starts straight at `docker stack config`.
+
 **Keep the single quotes around `PRINTCAST_AUTH`.** For swarm stacks Komodo
 does not pass an env file to Docker, because `docker stack deploy` cannot
 read one. It writes the Environment to `.env` and **shell-sources** it
