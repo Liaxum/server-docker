@@ -1,5 +1,10 @@
 # OBS Studio in LinuxServer's Selkies desktop, reached from a browser.
 #
+# No GPU drivers are installed here. On the NVIDIA host this runs on, the
+# NVIDIA Container Toolkit mounts the host driver's libraries in at start --
+# NVENC's libnvidia-encode among them -- so they always match the kernel
+# module, which a copy baked into the image would not.
+#
 # Built rather than pulled because there is no maintained OBS image to pull:
 # LinuxServer publishes none, and what Docker Hub has is single-maintainer and
 # years stale. Their base image is maintained, so the app is all this adds.
@@ -18,10 +23,7 @@ RUN apt-get update && \
       software-properties-common && \
     add-apt-repository -y ppa:obsproject/obs-studio && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      obs-studio \
-      # VAAPI drivers for the iGPU passed in as /dev/dri: Intel, then AMD.
-      intel-media-va-driver \
-      mesa-va-drivers && \
+      obs-studio && \
     apt-get purge -y --auto-remove \
       gpg-agent \
       software-properties-common && \

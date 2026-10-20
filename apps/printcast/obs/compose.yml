@@ -1,0 +1,57 @@
+# Standalone compose (NOT a swarm stack), on liaxum-gaming only:
+#
+#   cd apps/printcast/obs && cp .env.example .env    # fill it in
+#   docker compose up -d --build
+#
+# OBS Studio in a browser desktop, encoding on the gaming PC's NVIDIA GPU. It
+# captures BambuBoard's /live page from the printcast stack (../compose.yml)
+# and is reached on the web through that stack's obs-relay.
+#
+# Standalone because swarm cannot give a service a GPU, nor shm_size. It
+# joins web-net -- attachable for exactly this -- which is how it reaches
+# BambuBoard and how the relay reaches it. Nothing is published on the host:
+# the only way in is the Traefik route.
+#
+# Host prerequisite: the NVIDIA driver and the NVIDIA Container Toolkit, with
+# Docker configured to use it. See "OBS on the gaming PC" in the README.
+name: printcast-obs
+
+services:
+  obs:
+    build: .
+    image: printcast-obs:local
+    # Fixed, because the relay addresses it by this name across web-net.
+    container_name: printcast-obs
+    restart: unless-stopped
+    shm_size: "1gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            # The toolkit mounts the host driver's libraries in; the base
+            # image already asks for every driver capability, NVENC's "video"
+            # and OpenGL's "graphics" included.
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - PUID=${OBS_PUID:-1000}
+      - PGID=${OBS_PGID:-1000}
+      - TZ=${TZ:-Europe/Paris}
+      # The desktop's login, and the only one in front of it on the web: the
+      # Traefik route adds none. It is a full remote desktop holding the
+      # stream key, so make this long.
+      - CUSTOM_USER=${OBS_USER:-admin}
+      - PASSWORD=${OBS_PASSWORD:?set OBS_PASSWORD for the OBS desktop}
+    volumes:
+      # Scenes, profiles and the stream key.
+      - obs-config:/config
+    networks:
+      - web-net
+
+networks:
+  web-net:
+    external: true
+
+volumes:
+  obs-config:
