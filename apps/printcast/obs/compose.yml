@@ -209,8 +209,11 @@ services:
       - STREAM_WHEN=${STREAM_WHEN:-printing}
       # Seconds to keep streaming after a print ends, so viewers see the result.
       - STOP_DELAY=${STOP_DELAY:-300}
+    # Unprivileged, but not read_only: compose delivers an inline config by
+    # copying it into the container just before starting it, and Docker
+    # refuses to copy into a read-only filesystem. The container then stays
+    # "Created" and /autostream.py never appears.
     user: "65534:65534"
-    read_only: true
     networks:
       - web-net
 
