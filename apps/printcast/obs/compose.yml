@@ -40,7 +40,14 @@ services:
       #
       # Ubuntu, because OBS comes from the OBS project's PPA: its builds include
       # the browser source that captures BambuBoard, and Ubuntu's and Debian's
-      # own obs-studio packages are built without it.
+      # own obs-studio packages (versions with "+dfsg") are built without it.
+      #
+      # Adding the PPA is not enough on its own. A first build installed
+      # Ubuntu's 30.0.2+dfsg anyway, so the PPA is pinned above everything
+      # else, the index refreshed explicitly, and the build fails outright --
+      # printing apt's view of the package -- if what got installed has no
+      # browser plugin. A wrong OBS must not deploy silently again. (No $ in
+      # it: compose would interpolate one.)
       #
       # Nothing is purged afterwards, on purpose. The base already ships
       # software-properties-common, and its Python environment (/lsiopy) is
@@ -67,9 +74,18 @@ services:
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               gpg-agent && \
             add-apt-repository -y ppa:obsproject/obs-studio && \
+            printf 'Package: *\nPin: release o=LP-PPA-obsproject-obs-studio\nPin-Priority: 1001\n' \
+              > /etc/apt/preferences.d/obs-ppa && \
+            apt-get update && \
+            apt-cache policy obs-studio && \
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               obs-studio && \
             rm -rf /var/lib/apt/lists/* /tmp/*
+        RUN dpkg -L obs-studio | grep -q obs-browser || { \
+              echo "obs-studio has no browser source: not the OBS PPA build."; \
+              dpkg -s obs-studio | grep '^Version'; \
+              apt-cache policy obs-studio; \
+              exit 1; }
         RUN echo "obs --disable-shutdown-check" > /defaults/autostart
     image: printcast-obs:local
     # Never pulled: the image exists nowhere but here. Without this, Komodo's
