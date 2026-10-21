@@ -1000,6 +1000,39 @@ second, separate copy in the config volume, without this setup's GPU or
 browser fixes. The OBS built here is already installed and opens with the
 desktop.
 
+### Going live automatically
+
+The `autostream` service in `apps/printcast/obs/compose.yml` starts the stream
+when a print starts and stops it five minutes after the print ends. It reads
+the printer's state from BambuBoard (`http://bambuboard:8080/data.json`) and
+presses OBS's buttons through obs-websocket, which the image's startup script
+enables with `OBS_WS_PASSWORD` (default: the desktop's `OBS_PASSWORD`). The
+websocket is reachable only on `web-net`.
+
+It reacts to **changes**, not states:
+
+| What happens | What it does |
+|---|---|
+| A print starts (`PREPARE`, `RUNNING`) | starts the stream, if it is not already live |
+| Pause | nothing; the stream stays up |
+| The print ends (`FINISH`, `FAILED`, `IDLE`) | stops the stream `STOP_DELAY` seconds later (default 300) |
+| You start a stream by hand while idle | leaves it alone |
+| You stop the stream by hand mid-print | leaves it stopped until the next print |
+| BambuBoard unreachable (restart, outage) | nothing, so a restart never cuts a live stream |
+| BambuBoard has had no printer report for 15 min | treats the printer as off, which ends the print |
+
+So the stream key must already be set in OBS (**Settings → Stream**):
+`autostream` only presses *Start Streaming*. Its log says what it decided and
+why:
+
+```bash
+docker logs printcast-obs-autostream-1 --tail 20
+```
+
+`STREAM_WHEN=online` streams whenever the printer is reporting at all, idle
+included, instead of only during prints. Both it and `STOP_DELAY` go in the
+`printcast-obs` Stack's Environment.
+
 ### When OBS misbehaves
 
 OBS's own output never reaches `docker logs`, which only shows the desktop.
