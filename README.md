@@ -808,16 +808,38 @@ stack is unaffected.
 
 ### OBS on the gaming PC
 
-The host needs the NVIDIA driver and the
-[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html),
-with Docker pointed at it:
+The host needs the NVIDIA driver **with its user-space libraries**, and the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+with Docker pointed at it.
+
+The toolkit can only pass into a container what the host has installed. A
+compute-only ("headless") driver install has the kernel module and CUDA but
+not what OBS needs, and the container then starts with no GPU tooling at all.
+Check that the host has all four, in packages matching the installed driver
+version exactly (`dpkg -l | grep nvidia` shows it):
+
+| Needed for | Library | Ubuntu package |
+|---|---|---|
+| the `nvidia-smi` check below | `nvidia-smi` | `nvidia-utils-<ver>` |
+| NVENC, the whole point | `libnvidia-encode.so` | `libnvidia-encode-<ver>` |
+| hardware decoding | `libnvcuvid.so` | `libnvidia-decode-<ver>` |
+| OpenGL, which OBS draws with | `libEGL_nvidia.so`, `libGLX_nvidia.so` | `libnvidia-gl-<ver>` |
+
+Add `-server` to each name if the driver came from the `-server` packages.
+Then:
 
 ```bash
-sudo pacman -S nvidia-container-toolkit        # Arch; apt/dnf: see the guide above
 sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
-docker run --rm --gpus all ubuntu nvidia-smi   # must list the GPU
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+sudo systemctl enable --now nvidia-cdi-refresh.path   # regenerate on driver updates
+docker run --rm --gpus all ubuntu nvidia-smi         # must list the GPU
 ```
+
+`/etc/cdi/nvidia.yaml` is a snapshot of what the host had when it was
+generated. Install a missing library afterwards, or update the driver, and the
+old file keeps describing the old set until it is regenerated. The refresh
+unit does that automatically.
 
 The toolkit mounts the host driver's libraries into the container at start,
 NVENC's `libnvidia-encode` among them, so the image carries no GPU drivers.

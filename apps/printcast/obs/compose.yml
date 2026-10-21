@@ -18,8 +18,10 @@
 # a Dockerfile beside it, because a Komodo Stack written in the UI is a single
 # compose file on disk, with no build context to hold one.
 #
-# Host prerequisite: the NVIDIA driver and the NVIDIA Container Toolkit, with
-# Docker configured to use it. See "OBS on the gaming PC" in the README.
+# Host prerequisite: the NVIDIA driver WITH its user-space libraries (NVENC's
+# libnvidia-encode, OpenGL, nvidia-smi -- a compute-only install lacks them)
+# and the NVIDIA Container Toolkit, with Docker configured to use it. See "OBS
+# on the gaming PC" in the README.
 name: printcast-obs
 
 services:
