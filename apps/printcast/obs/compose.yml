@@ -66,6 +66,18 @@ services:
       # libraries in at start, NVENC's among them, so they always match the
       # running kernel module.
       #
+      # The Browser source runs on software rendering, forced by the init
+      # script below on every start (LinuxServer runs /custom-cont-init.d
+      # before the desktop). With hardware acceleration on -- OBS's default --
+      # its Chromium tries the GPU, but the desktop's virtual X screen is not
+      # driven by the NVIDIA card, the GPU process crashes three times, and
+      # Chromium takes OBS down with it at startup ("GPU process isn't
+      # usable. Goodbye."). The overlay page costs little to draw in software,
+      # and NVENC, which encodes the stream, is unaffected. The script writes
+      # the setting rather than leaving it to the UI because OBS dies before
+      # the UI is reachable once a Browser source is in the scene. (No $ in
+      # it: compose would interpolate one.)
+      #
       # The autostart line is what the base image launches once the desktop
       # is up: on first start it copies /defaults/autostart into the config
       # volume (X11, the base's default; Wayland would read autostart_wayland).
@@ -93,6 +105,20 @@ services:
                 exit 1; }; } && \
             rm -rf /var/lib/apt/lists/* /tmp/*
         RUN echo "obs --disable-shutdown-check" > /defaults/autostart
+        COPY --chmod=755 <<'EOF' /custom-cont-init.d/50-obs-browser-software
+        #!/bin/bash
+        # Keeps the Browser source off the GPU. See apps/printcast/obs/compose.yml.
+        mkdir -p /config/.config/obs-studio
+        cd /config/.config/obs-studio || exit 0
+        touch user.ini global.ini
+        if grep -q '^BrowserHWAccel=' user.ini; then sed -i 's/^BrowserHWAccel=.*/BrowserHWAccel=false/' user.ini
+        elif grep -q '^\[General\]' user.ini; then sed -i '/^\[General\]/a BrowserHWAccel=false' user.ini
+        else printf '[General]\nBrowserHWAccel=false\n' >> user.ini; fi
+        if grep -q '^BrowserHWAccel=' global.ini; then sed -i 's/^BrowserHWAccel=.*/BrowserHWAccel=false/' global.ini
+        elif grep -q '^\[General\]' global.ini; then sed -i '/^\[General\]/a BrowserHWAccel=false' global.ini
+        else printf '[General]\nBrowserHWAccel=false\n' >> global.ini; fi
+        chown -R abc:abc /config/.config/obs-studio
+        EOF
     image: printcast-obs:local
     # Never pulled: the image exists nowhere but here. Without this, Komodo's
     # Auto Pull runs `docker compose pull`, which tries Docker Hub for the
