@@ -825,7 +825,19 @@ version exactly (`dpkg -l | grep nvidia` shows it):
 | hardware decoding | `libnvcuvid.so` | `libnvidia-decode-<ver>` |
 | OpenGL, which OBS draws with | `libEGL_nvidia.so`, `libGLX_nvidia.so` | `libnvidia-gl-<ver>` |
 
-Add `-server` to each name if the driver came from the `-server` packages.
+The flavour has to match too. If `dpkg -l | grep nvidia` shows `-server`
+packages (`nvidia-headless-no-dkms-595-server-open` and the like), every name
+above takes `-server`: `libnvidia-encode-595-server` and so on. The plain
+names are a different driver branch at a different version, and apt will
+quietly offer to **remove the installed kernel modules** to make room for
+them, leaving the GPU with no driver after the next reboot. Dry-run first and
+go ahead only if nothing is removed and every NVIDIA package shows the
+installed driver's version:
+
+```bash
+sudo apt-get install -s <the four packages> | grep -E '^(Inst|Remv)'
+```
+
 Then:
 
 ```bash
