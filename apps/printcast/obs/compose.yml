@@ -1,6 +1,12 @@
 # Standalone compose (NOT a swarm stack), on liaxum-gaming only. Deploy it as
-# a Komodo Stack on the liaxum-gaming server with "Run Build" on (see
-# "Deploying from Komodo" in the README), or by hand:
+# a Komodo Stack targeting the liaxum-gaming SERVER -- not the Swarm -- with
+# "Run Build" on (see "Deploying from Komodo" in the README).
+#
+# Pointed at the Swarm, Komodo runs `docker stack deploy`, which rejects this
+# file with "reservations: additional property 'devices' is not allowed": the
+# GPU request is exactly what swarm cannot do.
+#
+# By hand, on liaxum-gaming:
 #
 #   cd apps/printcast/obs && cp .env.example .env    # fill it in
 #   docker compose up -d --build

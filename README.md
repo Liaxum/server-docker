@@ -888,6 +888,11 @@ Environment. The names matter, so use these exactly:
   Browser source URL has to change with it.
 - **`printcast-obs`** is the compose project name. It sets the volume that
   holds the scenes and stream key (`printcast-obs_obs-config`).
+- **`printcast-obs` targets a Server, never the Swarm.** Pointed at the
+  Swarm, Komodo runs `docker stack deploy`, which rejects the file with
+  `reservations: additional property 'devices' is not allowed`. The GPU
+  request is the thing swarm cannot do. The deploy log should show `docker
+  compose … up`.
 
 **Targeting the swarm.** A Stack deploys to a swarm only through a Komodo
 **Swarm** resource. If there is none yet, create one with `liaxum-vps` as its
