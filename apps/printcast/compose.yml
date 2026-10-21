@@ -44,6 +44,10 @@ services:
       # to X1, which is single-nozzle and would gate off the second nozzle and
       # AMS widgets until MQTT detection corrected it.
       - BAMBUBOARD_PRINTER_TYPE=H2D
+      # Verbose logging. Exposed because Setup's own toggle cannot stick: the
+      # image sets BAMBUBOARD_LOGGING=false, and like the printer variables it
+      # is re-applied over the saved config on every start.
+      - BAMBUBOARD_LOGGING=${BAMBU_VERBOSE:-false}
     volumes:
       # Setup, layouts and the published /live snapshot. Node-local, which the
       # placement below keeps on one node.
