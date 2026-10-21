@@ -86,12 +86,12 @@ services:
             apt-cache policy obs-studio && \
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               obs-studio && \
+            { dpkg -L obs-studio | grep -q obs-browser || { \
+                echo "obs-studio has no browser source: not the OBS PPA build."; \
+                dpkg -s obs-studio | grep '^Version'; \
+                apt-cache policy obs-studio; \
+                exit 1; }; } && \
             rm -rf /var/lib/apt/lists/* /tmp/*
-        RUN dpkg -L obs-studio | grep -q obs-browser || { \
-              echo "obs-studio has no browser source: not the OBS PPA build."; \
-              dpkg -s obs-studio | grep '^Version'; \
-              apt-cache policy obs-studio; \
-              exit 1; }
         RUN echo "obs --disable-shutdown-check" > /defaults/autostart
     image: printcast-obs:local
     # Never pulled: the image exists nowhere but here. Without this, Komodo's
