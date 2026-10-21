@@ -974,16 +974,20 @@ in its string for that reason.
 
 ### Setting up the stream
 
-1. At `https://print.liaxum.fr`, check **Setup → Connect**: MQTT, telemetry
+1. At BambuBoard's public address (`https://print.liaxum.fr`, or whatever
+   `PRINT_SUBDOMAIN` makes it), check **Setup → Connect**: MQTT, telemetry
    and camera report separately. Then **Layout**: start from the
    `default-h2d` template and **Publish to /live**. Note the scene size under
    the Live preview.
 2. At `https://obs.liaxum.fr`, set **Settings → Video → Base (Canvas)
    Resolution** to that size.
-3. Add one **Browser** source, URL `http://printcast_bambuboard:8080/live`
-   (the swarm service, over `web-net`, with no Traefik and no login in the
-   way), sized to the canvas. `?transparent=1` lets it layer over other
-   sources.
+3. Add one **Browser** source, *Local file* unticked, sized to the canvas,
+   URL **`http://bambuboard:8080/live`** (`?transparent=1` lets it layer
+   over other sources). That is the swarm service's short name on
+   `web-net`; `http://printcast_bambuboard:8080/live` is the same service.
+   **Not the public address.** That one is behind the Traefik login, and a
+   Browser source cannot answer a login prompt: it gets a 401 and draws
+   nothing, with no error in OBS's log.
 4. **Settings → Output**: an NVIDIA NVENC H.264 encoder. **Settings →
    Stream**: the service and stream key. Both persist in the
    `printcast-obs_obs-config` volume.
@@ -991,11 +995,39 @@ in its string for that reason.
 Re-publishing in BambuBoard updates `/live`, and so the stream, without
 touching OBS.
 
+Never install OBS from the desktop's sidebar **Apps** panel. That installs a
+second, separate copy in the config volume, without this setup's GPU or
+browser fixes. The OBS built here is already installed and opens with the
+desktop.
+
+### When OBS misbehaves
+
+OBS's own output never reaches `docker logs`, which only shows the desktop.
+Its logs are in the container:
+
+```bash
+docker exec printcast-obs sh -c 'tail -40 "$(ls -t /config/.config/obs-studio/logs/*.txt | head -1)"'
+```
+
+Two problems are handled by the image's startup script
+(`/custom-cont-init.d/50-obs-defaults`), so they should not come back. If
+they do, these are the symptoms:
+
+- **OBS dies as it loads a scene with a Browser source.** Running it by hand
+  (`docker exec -u abc -e DISPLAY=:1 -e HOME=/config printcast-obs obs`)
+  shows `GPU process isn't usable. Goodbye.` The Browser source's Chromium
+  tried the GPU on a virtual screen the NVIDIA card does not drive. The
+  script sets `BrowserHWAccel=false` in `user.ini` and `global.ini`, which is
+  the *Settings → Advanced → Sources* toggle. NVENC encoding is unaffected.
+- **The log stops at `Crash or unclean shutdown detected`** and the desktop
+  shows a crash / Safe Mode dialog. Every container stop leaves OBS's run
+  marker (`.sentinel/run_*`) behind, so the next launch looks like crash
+  recovery. The script deletes stale markers before OBS starts. OBS 32 has
+  no command-line flag for this.
+
 If NVENC is missing from the encoder list, the GPU is not reaching containers:
-`docker run --rm --gpus all ubuntu nvidia-smi` on the gaming PC must list it. If the desktop is sluggish, OBS may be
-compositing in software: the Selkies desktop's OpenGL on NVIDIA's proprietary
-driver is the least proven part of this setup, and NVENC can still encode
-when compositing is in software.
+`docker run --rm --gpus all ubuntu nvidia-smi` on the gaming PC must list it.
+While streaming, `nvidia-smi` on the gaming PC should show an `obs` process.
 
 BambuBoard can also stream to YouTube by itself (Live → *Direct YouTube
 streaming*), with no OBS at all. It is beta, YouTube only, CPU-encoded on the
