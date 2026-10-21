@@ -78,13 +78,20 @@ services:
       # the UI is reachable once a Browser source is in the scene. (No $ in
       # it: compose would interpolate one.)
       #
+      # The init script also clears OBS's crash markers. OBS writes
+      # .sentinel/run_<uuid> at launch and removes it on a clean exit; one
+      # left over at the next launch makes OBS open a crash / Safe Mode
+      # dialog and wait for a click before loading the scene. A container is
+      # always stopped by signal, so without this every restart or redeploy
+      # leaves OBS blocked behind that dialog. At init OBS is not running, so
+      # any marker is stale by definition. (OBS 32 has no flag for this: the
+      # old --disable-shutdown-check is gone.)
+      #
       # The autostart line is what the base image launches once the desktop
       # is up: on first start it copies /defaults/autostart into the config
       # volume (X11, the base's default; Wayland would read autostart_wayland).
       # Being a first-start copy, a later change here does not reach an
-      # existing volume until ~/.config/openbox/autostart is deleted from it. --disable-shutdown-check because the container is stopped by
-      # signal, which OBS counts as a crash, and the safe-mode prompt it then
-      # opens on every start would sit in front of the scene.
+      # existing volume until ~/.config/openbox/autostart is deleted from it.
       dockerfile_inline: |
         FROM ghcr.io/linuxserver/baseimage-selkies:ubuntunoble
         ENV TITLE="OBS Studio"
@@ -104,12 +111,15 @@ services:
                 apt-cache policy obs-studio; \
                 exit 1; }; } && \
             rm -rf /var/lib/apt/lists/* /tmp/*
-        RUN echo "obs --disable-shutdown-check" > /defaults/autostart
-        COPY --chmod=755 <<'EOF' /custom-cont-init.d/50-obs-browser-software
+        RUN echo "obs" > /defaults/autostart
+        COPY --chmod=755 <<'EOF' /custom-cont-init.d/50-obs-defaults
         #!/bin/bash
-        # Keeps the Browser source off the GPU. See apps/printcast/obs/compose.yml.
+        # Runs before the desktop starts. See apps/printcast/obs/compose.yml.
         mkdir -p /config/.config/obs-studio
         cd /config/.config/obs-studio || exit 0
+        # Every container stop leaves a run marker that reads as a crash.
+        rm -f .sentinel/run_*
+        # Browser source off the GPU.
         touch user.ini global.ini
         if grep -q '^BrowserHWAccel=' user.ini; then sed -i 's/^BrowserHWAccel=.*/BrowserHWAccel=false/' user.ini
         elif grep -q '^\[General\]' user.ini; then sed -i '/^\[General\]/a BrowserHWAccel=false' user.ini
