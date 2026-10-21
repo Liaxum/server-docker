@@ -42,12 +42,18 @@ services:
       # the browser source that captures BambuBoard, and Ubuntu's and Debian's
       # own obs-studio packages (versions with "+dfsg") are built without it.
       #
-      # Adding the PPA is not enough on its own. A first build installed
-      # Ubuntu's 30.0.2+dfsg anyway, so the PPA is pinned above everything
-      # else, the index refreshed explicitly, and the build fails outright --
-      # printing apt's view of the package -- if what got installed has no
-      # browser plugin. A wrong OBS must not deploy silently again. (No $ in
-      # it: compose would interpolate one.)
+      # Adding the PPA is not enough on its own. When Launchpad cannot serve
+      # the PPA's package index (it has answered 503 for hours at a time), apt
+      # only warns, ignores the PPA and installs Ubuntu's 30.0.2+dfsg, which
+      # is how a first build shipped an OBS with no Browser source. So:
+      #   - index downloads are retried, riding out brief outages;
+      #   - obs-studio alone is pinned to the PPA. Only that package: a pin on
+      #     everything there would also force any lower-versioned PPA library
+      #     over the base image's, and apt refuses such downgrades;
+      #   - the build fails outright, printing apt's view of the package, if
+      #     what got installed has no browser plugin. If it fails that way,
+      #     Launchpad is usually down: retry later. (No $ in the check:
+      #     compose would interpolate one.)
       #
       # Nothing is purged afterwards, on purpose. The base already ships
       # software-properties-common, and its Python environment (/lsiopy) is
@@ -70,13 +76,13 @@ services:
       dockerfile_inline: |
         FROM ghcr.io/linuxserver/baseimage-selkies:ubuntunoble
         ENV TITLE="OBS Studio"
-        RUN apt-get update && \
+        RUN apt-get -o Acquire::Retries=5 update && \
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               gpg-agent && \
-            add-apt-repository -y ppa:obsproject/obs-studio && \
-            printf 'Package: *\nPin: release o=LP-PPA-obsproject-obs-studio\nPin-Priority: 1001\n' \
+            add-apt-repository -y -n ppa:obsproject/obs-studio && \
+            printf 'Package: obs-studio\nPin: release o=LP-PPA-obsproject-obs-studio\nPin-Priority: 1001\n' \
               > /etc/apt/preferences.d/obs-ppa && \
-            apt-get update && \
+            apt-get -o Acquire::Retries=5 update && \
             apt-cache policy obs-studio && \
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               obs-studio && \
