@@ -42,12 +42,22 @@ services:
       # the browser source that captures BambuBoard, and Ubuntu's and Debian's
       # own obs-studio packages are built without it.
       #
+      # Nothing is purged afterwards, on purpose. The base already ships
+      # software-properties-common, and its Python environment (/lsiopy) is
+      # built with --system-site-packages, so Selkies imports system modules
+      # such as `distro` that come with it. Purging it with --auto-remove
+      # takes those along, and the desktop then dies at start with
+      # "ModuleNotFoundError: No module named 'distro'".
+      #
       # No GPU drivers: the NVIDIA Container Toolkit mounts the host driver's
       # libraries in at start, NVENC's among them, so they always match the
       # running kernel module.
       #
       # The autostart line is what the base image launches once the desktop
-      # is up. --disable-shutdown-check because the container is stopped by
+      # is up: on first start it copies /defaults/autostart into the config
+      # volume (X11, the base's default; Wayland would read autostart_wayland).
+      # Being a first-start copy, a later change here does not reach an
+      # existing volume until ~/.config/openbox/autostart is deleted from it. --disable-shutdown-check because the container is stopped by
       # signal, which OBS counts as a crash, and the safe-mode prompt it then
       # opens on every start would sit in front of the scene.
       dockerfile_inline: |
@@ -55,11 +65,10 @@ services:
         ENV TITLE="OBS Studio"
         RUN apt-get update && \
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-              gpg-agent software-properties-common && \
+              gpg-agent && \
             add-apt-repository -y ppa:obsproject/obs-studio && \
             DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
               obs-studio && \
-            apt-get purge -y --auto-remove gpg-agent software-properties-common && \
             rm -rf /var/lib/apt/lists/* /tmp/*
         RUN echo "obs --disable-shutdown-check" > /defaults/autostart
     image: printcast-obs:local
