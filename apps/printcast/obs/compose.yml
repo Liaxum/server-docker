@@ -1,6 +1,6 @@
 # Standalone compose (NOT a swarm stack), on liaxum-gaming only. Deploy it as
-# a Komodo Stack targeting the liaxum-gaming SERVER -- not the Swarm -- with
-# "Run Build" on (see "Deploying from Komodo" in the README).
+# a Komodo Stack targeting the liaxum-gaming SERVER -- not the Swarm (see
+# "Deploying from Komodo" in the README).
 #
 # Pointed at the Swarm, Komodo runs `docker stack deploy`, which rejects this
 # file with "reservations: additional property 'devices' is not allowed": the
@@ -63,6 +63,12 @@ services:
             rm -rf /var/lib/apt/lists/* /tmp/*
         RUN echo "obs --disable-shutdown-check" > /defaults/autostart
     image: printcast-obs:local
+    # Never pulled: the image exists nowhere but here. Without this, Komodo's
+    # Auto Pull runs `docker compose pull`, which tries Docker Hub for the
+    # missing tag and fails the deploy ("pull access denied") before `up`
+    # gets to build it. With it, pull skips the service and `up` builds it,
+    # so the deploy works whether Komodo's Run Build is on or not.
+    pull_policy: build
     # Fixed, because the relay addresses it by this name across web-net.
     container_name: printcast-obs
     restart: unless-stopped

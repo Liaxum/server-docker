@@ -867,8 +867,10 @@ desktop, rebuilt by them weekly, plus OBS from the OBS project's PPA. The PPA
 is the point: its OBS includes the browser source that captures BambuBoard,
 and Ubuntu's and Debian's own packages are built without it. That also rules
 out a stock LinuxServer desktop with OBS installed at start. The first build
-takes a few minutes. Redeploying with **Run Build** on, or `docker compose
-build --pull` by hand, picks up updates.
+takes a few minutes. Every deploy rebuilds from cache, which is quick; to pick
+up new OBS or base-image releases, run `docker compose build --pull
+--no-cache` on the gaming PC (or set those as Komodo's build extra args
+once) and redeploy.
 
 ### Deploying from Komodo
 
@@ -880,7 +882,7 @@ Environment. The names matter, so use these exactly:
 |---|---|---|
 | Target | **Swarm** (see below) | **Server** `liaxum-gaming` |
 | Compose file | `apps/printcast/compose.yml` | `apps/printcast/obs/compose.yml` |
-| Run Build | — (ignored for swarm) | **on**, or OBS is never built |
+| Run Build | — (ignored for swarm) | optional: `pull_policy: build` builds it on `up` |
 | Environment | see below | `OBS_PASSWORD = '[[OBS_PASSWORD]]'` |
 
 - **`printcast`** is the stack name `docker stack deploy` uses, and so it
