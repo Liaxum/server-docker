@@ -1,0 +1,466 @@
+# Standalone compose (NOT a swarm stack), on liaxum-gaming only. Deploy it as
+# a Komodo Stack targeting the liaxum-gaming SERVER -- not the Swarm (see
+# "Deploying from Komodo" in the README).
+#
+# Pointed at the Swarm, Komodo runs `docker stack deploy`, which rejects this
+# file with "reservations: additional property 'devices' is not allowed": the
+# GPU request is exactly what swarm cannot do.
+#
+# By hand, on liaxum-gaming:
+#
+#   cd apps/printcast/obs && cp .env.example .env    # fill it in
+#   docker compose up -d --build
+#
+# OBS Studio in a browser desktop, encoding on the gaming PC's NVIDIA GPU. It
+# captures BambuBoard's /live page from the printcast stack (../compose.yml)
+# and is reached on the web through that stack's obs-relay.
+#
+# Standalone because swarm cannot give a service a GPU, nor shm_size. It
+# joins web-net -- attachable for exactly this -- which is how it reaches
+# BambuBoard and how the relay reaches it. Nothing is published on the host:
+# the only way in is the Traefik route.
+#
+# Self-contained on purpose: the image is defined inline below rather than in
+# a Dockerfile beside it, because a Komodo Stack written in the UI is a single
+# compose file on disk, with no build context to hold one.
+#
+# Host prerequisite: the NVIDIA driver WITH its user-space libraries (NVENC's
+# libnvidia-encode, OpenGL, nvidia-smi -- a compute-only install lacks them)
+# and the NVIDIA Container Toolkit, with Docker configured to use it. See "OBS
+# on the gaming PC" in the README.
+name: printcast-obs
+
+services:
+  obs:
+    build:
+      # OBS in LinuxServer's Selkies desktop. Built rather than pulled because
+      # no maintained OBS image exists: LinuxServer publish none, and the
+      # most-pulled one on Docker Hub was last pushed in 2019. Their base is
+      # rebuilt weekly, so OBS is all this adds.
+      #
+      # Ubuntu, because OBS comes from the OBS project's PPA: its builds include
+      # the browser source that captures BambuBoard, and Ubuntu's and Debian's
+      # own obs-studio packages (versions with "+dfsg") are built without it.
+      #
+      # Adding the PPA is not enough on its own. When Launchpad cannot serve
+      # the PPA's package index (it has answered 503 for hours at a time), apt
+      # only warns, ignores the PPA and installs Ubuntu's 30.0.2+dfsg, which
+      # is how a first build shipped an OBS with no Browser source. So:
+      #   - index downloads are retried, riding out brief outages;
+      #   - obs-studio alone is pinned to the PPA. Only that package: a pin on
+      #     everything there would also force any lower-versioned PPA library
+      #     over the base image's, and apt refuses such downgrades;
+      #   - the build fails outright, printing apt's view of the package, if
+      #     what got installed has no browser plugin. If it fails that way,
+      #     Launchpad is usually down: retry later. (No $ in the check:
+      #     compose would interpolate one.)
+      #
+      # Nothing is purged afterwards, on purpose. The base already ships
+      # software-properties-common, and its Python environment (/lsiopy) is
+      # built with --system-site-packages, so Selkies imports system modules
+      # such as `distro` that come with it. Purging it with --auto-remove
+      # takes those along, and the desktop then dies at start with
+      # "ModuleNotFoundError: No module named 'distro'".
+      #
+      # No GPU drivers: the NVIDIA Container Toolkit mounts the host driver's
+      # libraries in at start, NVENC's among them, so they always match the
+      # running kernel module.
+      #
+      # The Browser source runs on software rendering, forced by the init
+      # script below on every start (LinuxServer runs /custom-cont-init.d
+      # before the desktop). With hardware acceleration on -- OBS's default --
+      # its Chromium tries the GPU, but the desktop's virtual X screen is not
+      # driven by the NVIDIA card, the GPU process crashes three times, and
+      # Chromium takes OBS down with it at startup ("GPU process isn't
+      # usable. Goodbye."). The overlay page costs little to draw in software,
+      # and NVENC, which encodes the stream, is unaffected. The script writes
+      # the setting rather than leaving it to the UI because OBS dies before
+      # the UI is reachable once a Browser source is in the scene. (No $ in
+      # it: compose would interpolate one.)
+      #
+      # The init script also clears OBS's crash markers. OBS writes
+      # .sentinel/run_<uuid> at launch and removes it on a clean exit; one
+      # left over at the next launch makes OBS open a crash / Safe Mode
+      # dialog and wait for a click before loading the scene. A container is
+      # always stopped by signal, so without this every restart or redeploy
+      # leaves OBS blocked behind that dialog. At init OBS is not running, so
+      # any marker is stale by definition. (OBS 32 has no flag for this: the
+      # old --disable-shutdown-check is gone.)
+      #
+      # The autostart line is what the base image launches once the desktop
+      # is up: on first start it copies /defaults/autostart into the config
+      # volume (X11, the base's default; Wayland would read autostart_wayland).
+      # Being a first-start copy, a later change here does not reach an
+      # existing volume until ~/.config/openbox/autostart is deleted from it.
+      dockerfile_inline: |
+        FROM ghcr.io/linuxserver/baseimage-selkies:ubuntunoble
+        ENV TITLE="OBS Studio"
+        RUN apt-get -o Acquire::Retries=5 update && \
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              gpg-agent && \
+            add-apt-repository -y -n ppa:obsproject/obs-studio && \
+            printf 'Package: obs-studio\nPin: release o=LP-PPA-obsproject-obs-studio\nPin-Priority: 1001\n' \
+              > /etc/apt/preferences.d/obs-ppa && \
+            apt-get -o Acquire::Retries=5 update && \
+            apt-cache policy obs-studio && \
+            DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+              obs-studio && \
+            { dpkg -L obs-studio | grep -q obs-browser || { \
+                echo "obs-studio has no browser source: not the OBS PPA build."; \
+                dpkg -s obs-studio | grep '^Version'; \
+                apt-cache policy obs-studio; \
+                exit 1; }; } && \
+            rm -rf /var/lib/apt/lists/* /tmp/*
+        RUN echo "obs" > /defaults/autostart
+        COPY --chmod=755 <<'EOF' /custom-cont-init.d/50-obs-defaults
+        #!/usr/bin/with-contenv bash
+        # Runs before the desktop starts. See apps/printcast/obs/compose.yml.
+        mkdir -p /config/.config/obs-studio
+        cd /config/.config/obs-studio || exit 0
+        # Every container stop leaves a run marker that reads as a crash.
+        rm -f .sentinel/run_*
+        # Browser source off the GPU.
+        touch user.ini global.ini
+        if grep -q '^BrowserHWAccel=' user.ini; then sed -i 's/^BrowserHWAccel=.*/BrowserHWAccel=false/' user.ini
+        elif grep -q '^\[General\]' user.ini; then sed -i '/^\[General\]/a BrowserHWAccel=false' user.ini
+        else printf '[General]\nBrowserHWAccel=false\n' >> user.ini; fi
+        if grep -q '^BrowserHWAccel=' global.ini; then sed -i 's/^BrowserHWAccel=.*/BrowserHWAccel=false/' global.ini
+        elif grep -q '^\[General\]' global.ini; then sed -i '/^\[General\]/a BrowserHWAccel=false' global.ini
+        else printf '[General]\nBrowserHWAccel=false\n' >> global.ini; fi
+        # obs-websocket on, for the autostream service; off without a password.
+        python3 - <<'PY'
+        import json, os, pathlib
+        p = pathlib.Path("/config/.config/obs-studio/plugin_config/obs-websocket/config.json")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            cfg = json.loads(p.read_text())
+        except Exception:
+            cfg = {}
+        password = os.environ.get("OBS_WS_PASSWORD", "")
+        cfg.update(first_load=False, alerts_enabled=False, server_port=4455, server_enabled=bool(password))
+        if password:
+            cfg.update(auth_required=True, server_password=password)
+        p.write_text(json.dumps(cfg, indent=4))
+        PY
+        chown -R abc:abc /config/.config/obs-studio
+        EOF
+    image: printcast-obs:local
+    # Never pulled: the image exists nowhere but here. Without this, Komodo's
+    # Auto Pull runs `docker compose pull`, which tries Docker Hub for the
+    # missing tag and fails the deploy ("pull access denied") before `up`
+    # gets to build it. With it, pull skips the service and `up` builds it,
+    # so the deploy works whether Komodo's Run Build is on or not.
+    pull_policy: build
+    # Fixed, because the relay addresses it by this name across web-net.
+    container_name: printcast-obs
+    restart: unless-stopped
+    shm_size: "1gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            # The base image already asks for every driver capability,
+            # NVENC's "video" and OpenGL's "graphics" included.
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    environment:
+      - PUID=${OBS_PUID:-1000}
+      - PGID=${OBS_PGID:-1000}
+      - TZ=${TZ:-Europe/Paris}
+      # The desktop's login, and the only one in front of it on the web: the
+      # Traefik route adds none. It is a full remote desktop holding the
+      # stream key, so make this long.
+      - CUSTOM_USER=${OBS_USER:-admin}
+      - PASSWORD=${OBS_PASSWORD:?set OBS_PASSWORD for the OBS desktop}
+      # obs-websocket's password, which the autostream service uses to start
+      # and stop the stream. Defaults to the desktop password. The websocket
+      # is reachable only on web-net, not published anywhere.
+      - OBS_WS_PASSWORD=${OBS_WS_PASSWORD:-${OBS_PASSWORD}}
+    volumes:
+      # Scenes, profiles and the stream key.
+      - obs-config:/config
+    networks:
+      - web-net
+
+  # Starts the stream when a print starts and stops it STOP_DELAY seconds after
+  # it ends, by watching BambuBoard's /data.json and driving OBS through
+  # obs-websocket. It acts only on those changes, so a stream started or
+  # stopped by hand stays that way until the next one.
+  #
+  # The script is inline (configs below) rather than a file beside this one,
+  # for the same reason the image is: a Komodo Stack written in the UI is a
+  # single compose file. Standard library only, on the stock python image.
+  autostream:
+    image: python:3.13-alpine
+    restart: unless-stopped
+    depends_on:
+      - obs
+    command: ["python", "-u", "/autostream.py"]
+    configs:
+      - source: autostream
+        target: /autostream.py
+    environment:
+      - OBS_WS_HOST=printcast-obs
+      - OBS_WS_PASSWORD=${OBS_WS_PASSWORD:-${OBS_PASSWORD}}
+      - BAMBUBOARD_URL=http://bambuboard:8080
+      # "printing" (stream while a print is active) or "online" (whenever the
+      # printer is reporting at all).
+      - STREAM_WHEN=${STREAM_WHEN:-printing}
+      # Seconds to keep streaming after a print ends, so viewers see the result.
+      - STOP_DELAY=${STOP_DELAY:-300}
+    # Unprivileged, but not read_only: compose delivers an inline config by
+    # copying it into the container just before starting it, and Docker
+    # refuses to copy into a read-only filesystem. The container then stays
+    # "Created" and /autostream.py never appears.
+    user: "65534:65534"
+    networks:
+      - web-net
+
+configs:
+  autostream:
+    content: |
+      """Start and stop OBS's stream with the printer.
+
+      Polls BambuBoard's /data.json for the printer's state and drives OBS through
+      obs-websocket (protocol v5). Standard library only, so it runs on the stock
+      python image with nothing to install.
+
+      It acts on changes, not on levels: a print starting starts the stream, a print
+      ending stops it STOP_DELAY seconds later. In between it does nothing, so a
+      stream started by hand while idle, or stopped by hand mid-print, stays that
+      way until the next change.
+      """
+
+      import base64
+      import hashlib
+      import json
+      import os
+      import secrets
+      import socket
+      import struct
+      import time
+      import urllib.request
+
+      BAMBUBOARD = os.environ.get("BAMBUBOARD_URL", "http://bambuboard:8080").rstrip("/")
+      OBS_HOST = os.environ.get("OBS_WS_HOST", "printcast-obs")
+      OBS_PORT = int(os.environ.get("OBS_WS_PORT", "4455"))
+      OBS_PASSWORD = os.environ.get("OBS_WS_PASSWORD", "")
+      # "printing": stream while a print is active. "online": stream whenever the
+      # printer is reporting at all.
+      WHEN = os.environ.get("STREAM_WHEN", "printing")
+      # Keep streaming this long after the print ends, so viewers see the result.
+      STOP_DELAY = int(os.environ.get("STOP_DELAY", "300"))
+      POLL = int(os.environ.get("POLL_INTERVAL", "5"))
+      # BambuBoard stamps each printer report; older than this means it has lost the
+      # printer (powered off, network). Generous on purpose: an idle printer can go
+      # minutes between reports, and BambuBoard asks for a full one only every five.
+      STALE_AFTER = int(os.environ.get("STALE_AFTER", "900"))
+
+      ACTIVE = {"PREPARE", "SLICING", "RUNNING", "PAUSE"}
+
+
+      def log(msg):
+          print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+
+
+      _last_problem = {}
+
+
+      def problem(source, msg):
+          """Log a failure once, not on every poll while it lasts."""
+          msg = str(msg)
+          if _last_problem.get(source) != msg:
+              _last_problem[source] = msg
+              log(f"{source}: {msg}")
+
+
+      def recovered(source):
+          if _last_problem.pop(source, None) is not None:
+              log(f"{source}: reachable again")
+
+
+      def printer_wants_stream():
+          """True or False, or None when BambuBoard cannot be reached -- which must
+          not count as the print ending, or a BambuBoard restart would cut the
+          stream. A printer BambuBoard has lost, though, is not printing."""
+          try:
+              with urllib.request.urlopen(BAMBUBOARD + "/data.json", timeout=5) as res:
+                  data = json.load(res)
+          except Exception as exc:
+              problem("bambuboard", exc)
+              return None
+          recovered("bambuboard")
+          received = data.get("_bb_received_at")
+          fresh = isinstance(received, (int, float)) and time.time() - received / 1000 < STALE_AFTER
+          if not fresh:
+              return False
+          if WHEN == "online":
+              return True
+          state = (data.get("print") or {}).get("gcode_state")
+          return state in ACTIVE
+
+
+      # --- obs-websocket v5 ------------------------------------------------------
+
+
+      class OBS:
+          """One short-lived connection per use: actions happen a few times per
+          print, so there is no connection to keep alive or recover."""
+
+          def __enter__(self):
+              self.sock = socket.create_connection((OBS_HOST, OBS_PORT), timeout=10)
+              key = base64.b64encode(secrets.token_bytes(16)).decode()
+              self.sock.sendall(
+                  (
+                      f"GET / HTTP/1.1\r\nHost: {OBS_HOST}:{OBS_PORT}\r\n"
+                      "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                      f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+                      "Sec-WebSocket-Protocol: obswebsocket.json\r\n\r\n"
+                  ).encode()
+              )
+              head = b""
+              while b"\r\n\r\n" not in head:
+                  chunk = self.sock.recv(4096)
+                  if not chunk:
+                      raise ConnectionError("obs closed the connection during the handshake")
+                  head += chunk
+              head, self.buf = head.split(b"\r\n\r\n", 1)
+              if b" 101 " not in head.split(b"\r\n", 1)[0]:
+                  raise ConnectionError("obs refused the websocket upgrade: " + head.split(b"\r\n", 1)[0].decode())
+
+              hello = self._recv()
+              identify = {"rpcVersion": 1, "eventSubscriptions": 0}
+              auth = hello.get("d", {}).get("authentication")
+              if auth:
+                  secret = base64.b64encode(hashlib.sha256((OBS_PASSWORD + auth["salt"]).encode()).digest())
+                  identify["authentication"] = base64.b64encode(
+                      hashlib.sha256(secret + auth["challenge"].encode()).digest()
+                  ).decode()
+              self._send({"op": 1, "d": identify})
+              reply = self._recv()
+              if reply.get("op") != 2:
+                  raise PermissionError("obs did not accept the websocket password")
+              return self
+
+          def __exit__(self, *exc):
+              try:
+                  # A proper close (1000, normal), so OBS does not log every
+                  # action as a client dropping off.
+                  mask = secrets.token_bytes(4)
+                  code = struct.pack("!H", 1000)
+                  self.sock.sendall(bytes([0x88, 0x82]) + mask + bytes(b ^ mask[i] for i, b in enumerate(code)))
+                  self.sock.close()
+              except OSError:
+                  pass
+
+          def request(self, kind):
+              rid = secrets.token_hex(4)
+              self._send({"op": 6, "d": {"requestType": kind, "requestId": rid}})
+              while True:
+                  msg = self._recv()
+                  if msg.get("op") == 7 and msg["d"].get("requestId") == rid:
+                      status = msg["d"]["requestStatus"]
+                      if not status.get("result"):
+                          raise RuntimeError(f"{kind}: {status.get('comment') or status.get('code')}")
+                      return msg["d"].get("responseData") or {}
+
+          def _send(self, obj):
+              data = json.dumps(obj).encode()
+              head = bytes([0x81])  # final frame, text
+              if len(data) < 126:
+                  head += bytes([0x80 | len(data)])
+              elif len(data) < 65536:
+                  head += bytes([0x80 | 126]) + struct.pack("!H", len(data))
+              else:
+                  head += bytes([0x80 | 127]) + struct.pack("!Q", len(data))
+              mask = secrets.token_bytes(4)  # clients must mask every frame
+              self.sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+          def _read(self, n):
+              while len(self.buf) < n:
+                  chunk = self.sock.recv(65536)
+                  if not chunk:
+                      raise ConnectionError("obs closed the connection")
+                  self.buf += chunk
+              out, self.buf = self.buf[:n], self.buf[n:]
+              return out
+
+          def _recv(self):
+              while True:
+                  b0, b1 = self._read(2)
+                  n = b1 & 0x7F
+                  if n == 126:
+                      (n,) = struct.unpack("!H", self._read(2))
+                  elif n == 127:
+                      (n,) = struct.unpack("!Q", self._read(8))
+                  mask = self._read(4) if b1 & 0x80 else None
+                  payload = self._read(n)
+                  if mask:
+                      payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+                  opcode = b0 & 0x0F
+                  if opcode == 0x8:
+                      code = struct.unpack("!H", payload[:2])[0] if len(payload) >= 2 else None
+                      if code == 4009:  # obs-websocket's AuthenticationFailed
+                          raise PermissionError("wrong OBS_WS_PASSWORD (obs refused it)")
+                      raise ConnectionError(f"obs closed the websocket (code {code})")
+                  if opcode == 0x9:  # ping: answer, then keep reading
+                      self.sock.sendall(bytes([0x8A, 0x80 | len(payload)]) + b"\0\0\0\0" + payload)
+                      continue
+                  if opcode == 0x1:
+                      return json.loads(payload)
+
+
+      def set_streaming(on):
+          """Bring OBS to the wanted state. False on any failure, so the caller
+          retries on the next poll -- OBS may simply still be starting."""
+          try:
+              with OBS() as obs:
+                  active = obs.request("GetStreamStatus").get("outputActive")
+                  if on and not active:
+                      obs.request("StartStream")
+                      log("stream started")
+                  elif not on and active:
+                      obs.request("StopStream")
+                      log("stream stopped")
+              recovered("obs")
+              return True
+          except Exception as exc:
+              problem("obs", exc)
+              return False
+
+
+      def main():
+          if not OBS_PASSWORD:
+              log("OBS_WS_PASSWORD is not set; it must match the OBS container's")
+          log(f"watching {BAMBUBOARD} (stream when {WHEN}, stop {STOP_DELAY}s after), obs at {OBS_HOST}:{OBS_PORT}")
+          applied = None  # the state last brought about, None until the first change
+          off_since = None
+          while True:
+              wants = printer_wants_stream()
+              if wants is not None:
+                  now = time.monotonic()
+                  if wants:
+                      off_since = None
+                      decision = True
+                  else:
+                      off_since = off_since or now
+                      decision = False if now - off_since >= STOP_DELAY else applied
+                  if decision is not None and decision != applied:
+                      if applied is None and decision is False:
+                          # Idle at startup: not a print ending, so leave OBS alone.
+                          applied = False
+                      elif set_streaming(decision):
+                          applied = decision
+              time.sleep(POLL)
+
+
+      if __name__ == "__main__":
+          main()
+
+networks:
+  web-net:
+    external: true
+
+volumes:
+  obs-config:

@@ -17,6 +17,8 @@ centralized NFS persistent storage and a Traefik reverse proxy.
 | `apps/nfs/compose.yml` | **standalone compose** on the VPS | exports `/shared` over Tailscale |
 | `apps/filebrowser/compose.yml` | stack `files` | web UI on the shared volume |
 | `apps/monitor/compose.yml` | stack `monitor` | Komodo core, Mongo, global agents, MCP |
+| `apps/printcast/compose.yml` | stack `printcast` | BambuBoard: printer camera + telemetry overlay, on Traefik |
+| `apps/printcast/obs/compose.yml` | **standalone compose** on `liaxum-gaming` | OBS with NVENC, streams the overlay |
 | `scripts/bootstrap.sh` | — | brings the manager up from nothing |
 | `scripts/join-worker.sh` | — | adds a worker to the mesh, then the swarm |
 
@@ -757,6 +759,320 @@ sudo systemctl restart systemd-resolved
 `/etc/resolv.conf` must then point somewhere real rather than at `127.0.0.53`,
 or the host loses DNS the moment Pi-hole is down — which takes Tailscale and
 the image pulls with it.
+
+## Printer stream
+
+Live-streams the Bambu Lab X2D, with the camera and print telemetry
+(progress, time left, both nozzles, AMS, fans) composited by
+[BambuBoard](https://github.com/t0nyz0/BambuBoard) and encoded by OBS on the
+gaming PC's NVIDIA GPU:
+
+```
+printer --rtsps:322 + mqtts:8883--> bambuboard (liaxum-mini) --web-net /live--> obs (liaxum-gaming) --> Twitch / YouTube
+browser --https--> traefik --> bambuboard            https://print.liaxum.fr   Traefik basic auth
+browser --https--> traefik --> obs-relay --> obs     https://obs.liaxum.fr     the desktop's own login
+```
+
+| File | Deployed as | Runs on |
+|---|---|---|
+| `apps/printcast/compose.yml` | stack `printcast` | `bambuboard` on liaxum-mini (it has to be on the printer's LAN), `obs-relay` on liaxum-gaming |
+| `apps/printcast/obs/compose.yml` | **standalone compose** | liaxum-gaming |
+
+BambuBoard is an ordinary swarm service with Traefik labels and **no
+published ports**. Traefik and OBS both reach it over `web-net`. That matters
+because BambuBoard has no login: an open port on the mini would put its setup
+and streaming controls on your LAN unauthenticated. The Traefik route adds
+basic auth and the stack refuses to deploy without it.
+
+OBS cannot be a swarm service, because swarm cannot hand a service a GPU (or
+`shm_size`). So it is standalone compose on the gaming PC, joined to
+`web-net`, which is attachable for exactly this. Traefik only reads labels off
+swarm services, so the stack's `obs-relay`, a one-line `socat` pinned to the
+same node, carries the labels and forwards raw TCP to the container by name.
+Raw TCP keeps the desktop's WebSockets intact. While the gaming PC is off,
+the relay cannot be placed and `obs.liaxum.fr` returns 404; the rest of the
+stack is unaffected.
+
+### On the printer first
+
+1. **LAN Only Liveview**: Settings → General. Without it the X2D reports its
+   stream URL as `disable` and serves no RTSPS, so the camera widget stays
+   black while telemetry works. This is separate from LAN Only Mode; Bambu
+   Cloud and Handy keep working.
+2. Note the **IP**, the **access code** (network settings) and the **serial
+   number**. Give the printer a DHCP reservation.
+3. If BambuBoard's Connect panel shows MQTT refused with the right access
+   code, the firmware is refusing third-party MQTT: turn on LAN Only Mode and
+   Developer Mode. This behaviour has changed across firmware releases, so try
+   without them first.
+
+### OBS on the gaming PC
+
+The host needs the NVIDIA driver **with its user-space libraries**, and the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+with Docker pointed at it.
+
+The toolkit can only pass into a container what the host has installed. A
+compute-only ("headless") driver install has the kernel module and CUDA but
+not what OBS needs, and the container then starts with no GPU tooling at all.
+Check that the host has all four, in packages matching the installed driver
+version exactly (`dpkg -l | grep nvidia` shows it):
+
+| Needed for | Library | Ubuntu package |
+|---|---|---|
+| the `nvidia-smi` check below | `nvidia-smi` | `nvidia-utils-<ver>` |
+| NVENC, the whole point | `libnvidia-encode.so` | `libnvidia-encode-<ver>` |
+| hardware decoding | `libnvcuvid.so` | `libnvidia-decode-<ver>` |
+| OpenGL, which OBS draws with | `libEGL_nvidia.so`, `libGLX_nvidia.so` | `libnvidia-gl-<ver>` |
+
+The flavour has to match too. If `dpkg -l | grep nvidia` shows `-server`
+packages (`nvidia-headless-no-dkms-595-server-open` and the like), every name
+above takes `-server`: `libnvidia-encode-595-server` and so on. The plain
+names are a different driver branch at a different version, and apt will
+quietly offer to **remove the installed kernel modules** to make room for
+them, leaving the GPU with no driver after the next reboot. Dry-run first and
+go ahead only if nothing is removed and every NVIDIA package shows the
+installed driver's version:
+
+```bash
+sudo apt-get install -s <the four packages> | grep -E '^(Inst|Remv)'
+```
+
+Then:
+
+```bash
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+sudo systemctl enable --now nvidia-cdi-refresh.path   # regenerate on driver updates
+docker run --rm --gpus all ubuntu nvidia-smi         # must list the GPU
+```
+
+`/etc/cdi/nvidia.yaml` is a snapshot of what the host had when it was
+generated. Install a missing library afterwards, or update the driver, and the
+old file keeps describing the old set until it is regenerated. The refresh
+unit does that automatically.
+
+The toolkit mounts the host driver's libraries into the container at start,
+NVENC's `libnvidia-encode` among them, so the image carries no GPU drivers.
+They always match the running kernel module, which a baked-in copy would not.
+
+The image is **built**, not pulled. Its definition is inline in
+`apps/printcast/obs/compose.yml` (`dockerfile_inline`), not a separate
+Dockerfile, because a Komodo Stack written in the UI is one compose file on
+disk with no build context beside it. Nobody
+publishes a maintained OBS-with-web-desktop image: the most-pulled one,
+`bandi13/docker-obs`, was last pushed in 2019. So this is LinuxServer's Selkies
+desktop, rebuilt by them weekly, plus OBS from the OBS project's PPA. The PPA
+is the point: its OBS includes the browser source that captures BambuBoard,
+and Ubuntu's and Debian's own packages are built without it. That also rules
+out a stock LinuxServer desktop with OBS installed at start. The first build
+takes a few minutes. Every deploy rebuilds from cache, which is quick; to pick
+up new OBS or base-image releases, run `docker compose build --pull
+--no-cache` on the gaming PC (or set those as Komodo's build extra args
+once) and redeploy.
+
+### Deploying from Komodo
+
+Both halves are Komodo **Stacks**, and both can be defined in the UI: paste
+the compose file into the Stack's compose editor and fill in its
+Environment. The names matter, so use these exactly:
+
+| | Stack `printcast` | Stack `printcast-obs` |
+|---|---|---|
+| Target | **Swarm** (see below) | **Server** `liaxum-gaming` |
+| Compose file | `apps/printcast/compose.yml` | `apps/printcast/obs/compose.yml` |
+| Run Build | — (ignored for swarm) | optional: `pull_policy: build` builds it on `up` |
+| Environment | see below | `OBS_PASSWORD = '[[OBS_PASSWORD]]'` |
+
+- **`printcast`** is the stack name `docker stack deploy` uses, and so it
+  sets the DNS name OBS captures: `printcast_bambuboard`. Rename it and the
+  Browser source URL has to change with it.
+- **`printcast-obs`** is the compose project name. It sets the volume that
+  holds the scenes and stream key (`printcast-obs_obs-config`).
+- **`printcast-obs` targets a Server, never the Swarm.** Pointed at the
+  Swarm, Komodo runs `docker stack deploy`, which rejects the file with
+  `reservations: additional property 'devices' is not allowed`. The GPU
+  request is the thing swarm cannot do. The deploy log should show `docker
+  compose … up`.
+
+**Targeting the swarm.** A Stack deploys to a swarm only through a Komodo
+**Swarm** resource. If there is none yet, create one with `liaxum-vps` as its
+manager server, then set the `printcast` Stack's target to it instead of a
+server. Komodo then runs `docker stack deploy` on the manager, and the
+placement constraints in the file put each service on its node.
+
+**Environment for `printcast`:**
+
+```
+BAMBU_HOST = 192.168.1.50
+BAMBU_SERIAL = [[BAMBU_SERIAL]]
+BAMBU_ACCESS_CODE = [[BAMBU_ACCESS_CODE]]
+PRINTCAST_AUTH = '[[PRINTCAST_AUTH]]'
+```
+
+Define the `[[...]]` ones under **Settings → Variables** with *secret*
+ticked, so they stay out of logs and away from non-admin users.
+`PRINTCAST_AUTH` is a bcrypt htpasswd line:
+`docker run --rm httpd:alpine htpasswd -nbB admin 'password'`.
+
+**This needs Komodo 2.1.0 or newer, on core and on the manager's
+periphery.** Komodo 2.0.x drops a swarm Stack's Environment entirely and runs
+`docker stack deploy` with none of it, so the first required variable fails:
+`required variable PRINTCAST_AUTH is missing a value`. The deploy log shows
+which you have. On 2.1+, the *Stack Config* stage's command starts with
+`set -a && . .env &&`; on 2.0 it starts straight at `docker stack config`.
+
+**Keep the single quotes around `PRINTCAST_AUTH`.** For swarm stacks Komodo
+does not pass an env file to Docker, because `docker stack deploy` cannot
+read one. It writes the Environment to `.env` and **shell-sources** it
+(`set -a && . .env && docker stack deploy …`). Unquoted, the shell expands
+every `$2y`, `$05`… in the hash. That fails silently: the deploy succeeds with
+a mangled hash, and the login never accepts anything. Komodo keeps the quotes
+when it writes the file, and secret interpolation happens before that, so
+`'[[PRINTCAST_AUTH]]'` is safe. The same goes for any other value with `$` or
+spaces in it, `OBS_PASSWORD` included: compose's own `.env` parsing expands
+`$` in unquoted values too.
+
+Either order of deploy works. The relay resolves `printcast-obs` on every
+connection, so until OBS is up `obs.liaxum.fr` just fails to connect, and it
+starts working as soon as the container exists. The certificate Traefik
+serves must cover `print.` and `obs.`, as it does `files.` and `monitor.`.
+
+**UI-defined or Git?** The Stacks can instead point at this repo (Git repo
+mode, the file paths above). The deploy button is the same, but the compose
+files then stay in one place. UI-defined Stacks are copies: an edit here does
+not reach Komodo until someone pastes it again, and an edit in Komodo never
+comes back here. If you go UI-defined, treat the Komodo copy as the live one
+and update this repo from it, or the two drift.
+
+**By hand**, without Komodo:
+
+```bash
+# on the manager: stack deploy reads the shell, not a .env file
+cp apps/printcast/stack.env.example apps/printcast/stack.env   # fill it in
+set -a; . apps/printcast/stack.env; set +a
+docker stack deploy -c apps/printcast/compose.yml printcast
+
+# on liaxum-gaming
+cd apps/printcast/obs && cp .env.example .env && docker compose up -d --build
+```
+
+The printer is defined by the stack environment, not BambuBoard's Setup
+page: BambuBoard re-applies the `BAMBUBOARD_PRINTER_*` variables over its
+saved config on every start, so an edit made in Setup lasts only until the
+next restart. `BAMBUBOARD_PRINTER_TYPE` is pinned to `H2D`. BambuBoard has no
+X2D profile and maps the X2D to its H2D one, but the image defaults to `X1`,
+which hides the second-nozzle and AMS widgets. The maintainer tests only on an
+X1C and an H2D, so check each widget against the X2D before going live.
+
+One CLI quirk shaped `compose.yml`, and it matters if you edit it. `docker
+stack deploy` silently skips a `${VAR:?message}` that has another `${...}`
+after it in the same string, so the result interpolates to empty, and it
+misparses a `-` inside the message. Every required variable there sits alone
+in its string for that reason.
+
+### Setting up the stream
+
+1. At BambuBoard's public address (`https://print.liaxum.fr`, or whatever
+   `PRINT_SUBDOMAIN` makes it), check **Setup → Connect**: MQTT, telemetry
+   and camera report separately. Then **Layout**: start from the
+   `default-h2d` template and **Publish to /live**. Note the scene size under
+   the Live preview.
+2. At `https://obs.liaxum.fr`, set **Settings → Video → Base (Canvas)
+   Resolution** to that size.
+3. Add one **Browser** source, *Local file* unticked, sized to the canvas,
+   URL **`http://bambuboard:8080/live`** (`?transparent=1` lets it layer
+   over other sources). That is the swarm service's short name on
+   `web-net`; `http://printcast_bambuboard:8080/live` is the same service.
+   **Not the public address.** That one is behind the Traefik login, and a
+   Browser source cannot answer a login prompt: it gets a 401 and draws
+   nothing, with no error in OBS's log.
+4. **Settings → Output**: an NVIDIA NVENC H.264 encoder. **Settings →
+   Stream**: the service and stream key. Both persist in the
+   `printcast-obs_obs-config` volume.
+
+Re-publishing in BambuBoard updates `/live`, and so the stream, without
+touching OBS.
+
+Never install OBS from the desktop's sidebar **Apps** panel. That installs a
+second, separate copy in the config volume, without this setup's GPU or
+browser fixes. The OBS built here is already installed and opens with the
+desktop.
+
+### Going live automatically
+
+The `autostream` service in `apps/printcast/obs/compose.yml` starts the stream
+when a print starts and stops it five minutes after the print ends. It reads
+the printer's state from BambuBoard (`http://bambuboard:8080/data.json`) and
+presses OBS's buttons through obs-websocket, which the image's startup script
+enables with `OBS_WS_PASSWORD` (default: the desktop's `OBS_PASSWORD`). The
+websocket is reachable only on `web-net`.
+
+It reacts to **changes**, not states:
+
+| What happens | What it does |
+|---|---|
+| A print starts (`PREPARE`, `RUNNING`) | starts the stream, if it is not already live |
+| Pause | nothing; the stream stays up |
+| The print ends (`FINISH`, `FAILED`, `IDLE`) | stops the stream `STOP_DELAY` seconds later (default 300) |
+| You start a stream by hand while idle | leaves it alone |
+| You stop the stream by hand mid-print | leaves it stopped until the next print |
+| BambuBoard unreachable (restart, outage) | nothing, so a restart never cuts a live stream |
+| BambuBoard has had no printer report for 15 min | treats the printer as off, which ends the print |
+
+So the stream key must already be set in OBS (**Settings → Stream**):
+`autostream` only presses *Start Streaming*. Its log says what it decided and
+why:
+
+```bash
+docker logs printcast-obs-autostream-1 --tail 20
+```
+
+`STREAM_WHEN=online` streams whenever the printer is reporting at all, idle
+included, instead of only during prints. Both it and `STOP_DELAY` go in the
+`printcast-obs` Stack's Environment.
+
+### When OBS misbehaves
+
+OBS's own output never reaches `docker logs`, which only shows the desktop.
+Its logs are in the container:
+
+```bash
+docker exec printcast-obs sh -c 'tail -40 "$(ls -t /config/.config/obs-studio/logs/*.txt | head -1)"'
+```
+
+Two problems are handled by the image's startup script
+(`/custom-cont-init.d/50-obs-defaults`), so they should not come back. If
+they do, these are the symptoms:
+
+- **OBS dies as it loads a scene with a Browser source.** Running it by hand
+  (`docker exec -u abc -e DISPLAY=:1 -e HOME=/config printcast-obs obs`)
+  shows `GPU process isn't usable. Goodbye.` The Browser source's Chromium
+  tried the GPU on a virtual screen the NVIDIA card does not drive. The
+  script sets `BrowserHWAccel=false` in `user.ini` and `global.ini`, which is
+  the *Settings → Advanced → Sources* toggle. NVENC encoding is unaffected.
+- **The log stops at `Crash or unclean shutdown detected`** and the desktop
+  shows a crash / Safe Mode dialog. Every container stop leaves OBS's run
+  marker (`.sentinel/run_*`) behind, so the next launch looks like crash
+  recovery. The script deletes stale markers before OBS starts. OBS 32 has
+  no command-line flag for this.
+
+If NVENC is missing from the encoder list, the GPU is not reaching containers:
+`docker run --rm --gpus all ubuntu nvidia-smi` on the gaming PC must list it.
+While streaming, `nvidia-smi` on the gaming PC should show an `obs` process.
+
+BambuBoard can also stream to YouTube by itself (Live → *Direct YouTube
+streaming*), with no OBS at all. It is beta, YouTube only, CPU-encoded on the
+mini, and sends silent audio, so treat it as a fallback for when the gaming PC
+is off, not a replacement.
+
+### Exposure
+
+`obs.liaxum.fr` is a full remote desktop on the internet, holding your stream
+key, behind one password. Tailscale already reaches the gaming PC from any of
+your own devices. If only you use it, `docker service scale
+printcast_obs-relay=0` closes the public route and OBS keeps streaming.
 
 ## Design decisions
 

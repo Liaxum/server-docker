@@ -1,0 +1,111 @@
+# Swarm stack. Deploy it as a Komodo Stack named exactly "printcast", targeting
+# the Swarm resource (see "Deploying from Komodo" in the README), or by hand
+# from the manager:
+#
+#   set -a; . apps/printcast/stack.env; set +a    # from stack.env.example
+#   docker stack deploy -c apps/printcast/compose.yml printcast
+#
+# The stack name is load-bearing: it makes the service's DNS name
+# printcast_bambuboard, which OBS's Browser source points at.
+#
+# Live-streams the Bambu Lab X2D. BambuBoard runs next to the printer on the
+# mini PC; OBS runs on the gaming PC for its NVIDIA encoder, and captures
+# BambuBoard's /live page across web-net:
+#
+#   printer --rtsps + mqtts--> bambuboard (liaxum-mini) --web-net /live--> obs (liaxum-gaming) --> Twitch/YouTube
+#   browser --https--> traefik --> bambuboard          (print.liaxum.fr)
+#   browser --https--> traefik --> obs-relay --> obs   (obs.liaxum.fr)
+#
+# OBS itself is NOT in this stack: swarm cannot hand a service a GPU. It is the
+# standalone compose project in obs/, which joins web-net so this stack and it
+# can reach each other. See "Printer stream" in the README.
+#
+# Every value without a default is required, and each ":?" sits alone in its
+# string on purpose: the docker CLI silently skips a ":?" with another ${}
+# after it in the same string, and misparses a "-" inside its message.
+services:
+  # Holds the printer's MQTT and camera connections. /live is the published
+  # layout, camera included; / is setup and layout.
+  #
+  # No published ports. Traefik reaches it over web-net, OBS too, and nothing
+  # else needs to: on the LAN, an open port would be its setup and streaming
+  # controls with no login.
+  bambuboard:
+    image: ghcr.io/t0nyz0/bambuboard:latest
+    environment:
+      # BambuBoard applies these over whatever Setup saved, on every start, so
+      # the stack environment -- not the UI -- is where the printer is defined.
+      - BAMBUBOARD_PRINTER_URL=${BAMBU_HOST:?set BAMBU_HOST to the printer LAN address}
+      - BAMBUBOARD_PRINTER_SN=${BAMBU_SERIAL:?set BAMBU_SERIAL to the printer serial number}
+      - BAMBUBOARD_PRINTER_ACCESS_CODE=${BAMBU_ACCESS_CODE:?set BAMBU_ACCESS_CODE from the printer network settings}
+      - BAMBUBOARD_PRINTER_NAME=${BAMBU_NAME:-X2D}
+      # BambuBoard has no X2D profile of its own and maps it to its H2D one,
+      # the nearest dual-nozzle model. Stated here because the image defaults
+      # to X1, which is single-nozzle and would gate off the second nozzle and
+      # AMS widgets until MQTT detection corrected it.
+      - BAMBUBOARD_PRINTER_TYPE=H2D
+      # Verbose logging. Exposed because Setup's own toggle cannot stick: the
+      # image sets BAMBUBOARD_LOGGING=false, and like the printer variables it
+      # is re-applied over the saved config on every start.
+      - BAMBUBOARD_LOGGING=${BAMBU_VERBOSE:-false}
+    volumes:
+      # Setup, layouts and the published /live snapshot. Node-local, which the
+      # placement below keeps on one node.
+      - bambuboard-data:/usr/src/app/data
+    networks:
+      - web-net
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          # The machine on the printer's LAN; the printer is not reachable
+          # from anywhere else.
+          - node.hostname == ${MINI_HOSTNAME:-liaxum-mini}
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=web-net"
+        - "traefik.http.routers.printcast.rule=Host(`${PRINT_SUBDOMAIN:-print}.${DOMAIN:-liaxum.fr}`)"
+        - "traefik.http.routers.printcast.entrypoints=websecure"
+        - "traefik.http.routers.printcast.tls=true"
+        - "traefik.http.routers.printcast.middlewares=printcast-auth"
+        # Required: BambuBoard has no login of its own, and without this the
+        # route would hand its setup and streaming controls to the internet.
+        # Interpolated values are not re-scanned, so the hash's own $ signs
+        # need no escaping here -- only quoting where the shell sees them.
+        - "traefik.http.middlewares.printcast-auth.basicauth.users=${PRINTCAST_AUTH:?set PRINTCAST_AUTH to an htpasswd line}"
+        - "traefik.http.services.printcast.loadbalancer.server.port=8080"
+
+  # Traefik reads labels only off swarm services, and OBS is a standalone
+  # container, so this relay carries its labels and forwards raw TCP to it by
+  # container name across web-net -- raw so the desktop's WebSockets pass
+  # untouched. Pinned to the same node so the name resolves locally; while the
+  # gaming PC is off the task cannot be placed, and the route simply 404s.
+  obs-relay:
+    image: alpine/socat:latest
+    command:
+      - "TCP-LISTEN:3000,fork,reuseaddr"
+      - "TCP:printcast-obs:3000"
+    networks:
+      - web-net
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.hostname == ${GAMING_HOSTNAME:-liaxum-gaming}
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=web-net"
+        - "traefik.http.routers.printcast-obs.rule=Host(`${OBS_SUBDOMAIN:-obs}.${DOMAIN:-liaxum.fr}`)"
+        - "traefik.http.routers.printcast-obs.entrypoints=websecure"
+        - "traefik.http.routers.printcast-obs.tls=true"
+        # No middleware: the desktop asks for its own login (OBS_USER /
+        # OBS_PASSWORD in obs/compose.yml), and two layers of basic auth would
+        # contend for the one Authorization header.
+        - "traefik.http.services.printcast-obs.loadbalancer.server.port=3000"
+
+networks:
+  web-net:
+    external: true
+
+volumes:
+  bambuboard-data:
