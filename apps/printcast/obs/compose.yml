@@ -183,10 +183,17 @@ services:
     networks:
       - web-net
 
-  # Starts the stream when a print starts and stops it STOP_DELAY seconds after
-  # it ends, by watching BambuBoard's /data.json and driving OBS through
-  # obs-websocket. It acts only on those changes, so a stream started or
-  # stopped by hand stays that way until the next one.
+  # Takes OBS live while the printer is switched on, and off air (stream
+  # stopped, then the OBS container stopped) STOP_DELAY seconds after it is
+  # switched off, so the gaming PC's GPU and CPU are free the rest of the
+  # time. It watches BambuBoard's live MQTT connection to the printer, drives
+  # OBS through obs-websocket, and starts and stops the container through
+  # docker-proxy below.
+  #
+  # It acts only on changes, so an OBS or a stream started or stopped by hand
+  # stays that way until the printer next switches on or off. STREAM_WHEN=
+  # printing narrows "live" to while a print is active; MANAGE_OBS=false
+  # leaves the container running and only starts and stops the stream.
   #
   # The script is inline (configs below) rather than a file beside this one,
   # for the same reason the image is: a Komodo Stack written in the UI is a
@@ -196,6 +203,7 @@ services:
     restart: unless-stopped
     depends_on:
       - obs
+      - docker-proxy
     command: ["python", "-u", "/autostream.py"]
     configs:
       - source: autostream
@@ -204,11 +212,16 @@ services:
       - OBS_WS_HOST=printcast-obs
       - OBS_WS_PASSWORD=${OBS_WS_PASSWORD:-${OBS_PASSWORD}}
       - BAMBUBOARD_URL=http://bambuboard:8080
-      # "printing" (stream while a print is active) or "online" (whenever the
-      # printer is reporting at all).
-      - STREAM_WHEN=${STREAM_WHEN:-printing}
-      # Seconds to keep streaming after a print ends, so viewers see the result.
+      # "online": live while the printer is switched on. "printing": live
+      # while a print is active.
+      - STREAM_WHEN=${STREAM_WHEN:-online}
+      # Seconds to wait before going off air. Rides out network blips and
+      # short power cycles, and lets viewers see a finished print.
       - STOP_DELAY=${STOP_DELAY:-300}
+      # Also start and stop the OBS container, not just its stream.
+      - MANAGE_OBS=${MANAGE_OBS:-true}
+      - DOCKER_URL=http://docker-proxy:2375
+      - OBS_CONTAINER=printcast-obs
     # Unprivileged, but not read_only: compose delivers an inline config by
     # copying it into the container just before starting it, and Docker
     # refuses to copy into a read-only filesystem. The container then stays
@@ -216,20 +229,49 @@ services:
     user: "65534:65534"
     networks:
       - web-net
+      - control
+
+  # The Docker API, cut down to starting and stopping containers. autostream
+  # needs exactly that for OBS, and the raw socket would be root on this host.
+  # POST=0 keeps everything else read-only, CONTAINERS=0 hides container
+  # details (env, passwords), and ALLOW_START/ALLOW_STOP are the two calls it
+  # makes. They are not scoped to one container -- the proxy cannot do that --
+  # so anything that reaches it could stop any container here. Hence its own
+  # internal network, which only autostream joins.
+  docker-proxy:
+    image: lscr.io/linuxserver/socket-proxy:latest
+    restart: unless-stopped
+    environment:
+      - ALLOW_START=1
+      - ALLOW_STOP=1
+      - POST=0
+      - CONTAINERS=0
+      - EVENTS=0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    read_only: true
+    tmpfs:
+      - /run
+    networks:
+      - control
 
 configs:
   autostream:
     content: |
-      """Start and stop OBS's stream with the printer.
+      """Take OBS live, and off air, with the printer.
 
-      Polls BambuBoard's /data.json for the printer's state and drives OBS through
-      obs-websocket (protocol v5). Standard library only, so it runs on the stock
-      python image with nothing to install.
+      Polls BambuBoard for the printer's state and drives OBS through obs-websocket
+      (protocol v5). With MANAGE_OBS it also starts the OBS container before going
+      live and stops it afterwards, through a Docker socket proxy that allows only
+      that. Standard library only, so it runs on the stock python image.
 
-      It acts on changes, not on levels: a print starting starts the stream, a print
-      ending stops it STOP_DELAY seconds later. In between it does nothing, so a
-      stream started by hand while idle, or stopped by hand mid-print, stays that
-      way until the next change.
+      When to be live is STREAM_WHEN: "online" while the printer is switched on
+      (BambuBoard holds an MQTT connection to it), "printing" while a print is
+      active. Going off air waits STOP_DELAY seconds, which rides out network blips
+      and lets viewers see a finished print.
+
+      It acts on changes, not on levels. In between it does nothing, so a stream or
+      an OBS started or stopped by hand stays that way until the next change.
       """
 
       import base64
@@ -240,17 +282,19 @@ configs:
       import socket
       import struct
       import time
+      import urllib.error
       import urllib.request
 
       BAMBUBOARD = os.environ.get("BAMBUBOARD_URL", "http://bambuboard:8080").rstrip("/")
       OBS_HOST = os.environ.get("OBS_WS_HOST", "printcast-obs")
       OBS_PORT = int(os.environ.get("OBS_WS_PORT", "4455"))
       OBS_PASSWORD = os.environ.get("OBS_WS_PASSWORD", "")
-      # "printing": stream while a print is active. "online": stream whenever the
-      # printer is reporting at all.
-      WHEN = os.environ.get("STREAM_WHEN", "printing")
-      # Keep streaming this long after the print ends, so viewers see the result.
+      WHEN = os.environ.get("STREAM_WHEN", "online")
       STOP_DELAY = int(os.environ.get("STOP_DELAY", "300"))
+      # Start and stop the OBS container too, not just its stream.
+      MANAGE_OBS = os.environ.get("MANAGE_OBS", "true").lower() in ("1", "true", "yes")
+      DOCKER = os.environ.get("DOCKER_URL", "http://docker-proxy:2375").rstrip("/")
+      OBS_CONTAINER = os.environ.get("OBS_CONTAINER", "printcast-obs")
       POLL = int(os.environ.get("POLL_INTERVAL", "5"))
       # BambuBoard stamps each printer report; older than this means it has lost the
       # printer (powered off, network). Generous on purpose: an idle printer can go
@@ -280,23 +324,32 @@ configs:
               log(f"{source}: reachable again")
 
 
+      def bambuboard(path):
+          with urllib.request.urlopen(BAMBUBOARD + path, timeout=5) as res:
+              return json.load(res)
+
+
       def printer_wants_stream():
           """True or False, or None when BambuBoard cannot be reached -- which must
-          not count as the print ending, or a BambuBoard restart would cut the
-          stream. A printer BambuBoard has lost, though, is not printing."""
+          not count as going off air, or a BambuBoard restart would cut the stream.
+          A printer BambuBoard has lost, though, is neither on nor printing."""
           try:
-              with urllib.request.urlopen(BAMBUBOARD + "/data.json", timeout=5) as res:
-                  data = json.load(res)
+              if WHEN == "online":
+                  # BambuBoard's live MQTT connection to the printer. A printer
+                  # switched off drops it within a keepalive, about a minute and a half.
+                  on = bambuboard("/status").get("connection") == "online"
+              else:
+                  data = bambuboard("/data.json")
           except Exception as exc:
               problem("bambuboard", exc)
               return None
           recovered("bambuboard")
+          if WHEN == "online":
+              return on
           received = data.get("_bb_received_at")
           fresh = isinstance(received, (int, float)) and time.time() - received / 1000 < STALE_AFTER
           if not fresh:
               return False
-          if WHEN == "online":
-              return True
           state = (data.get("print") or {}).get("gcode_state")
           return state in ACTIVE
 
@@ -411,6 +464,26 @@ configs:
                       return json.loads(payload)
 
 
+      def obs_container(action):
+          """Start or stop the OBS container. Docker answers 304 when it is already
+          in that state, which counts as success."""
+          url = f"{DOCKER}/containers/{OBS_CONTAINER}/{action}"
+          if action == "stop":
+              url += "?t=30"  # OBS gets 30 seconds to quit cleanly
+          try:
+              urllib.request.urlopen(urllib.request.Request(url, data=b"", method="POST"), timeout=60).close()
+              log(f"obs container: {action} sent")
+          except urllib.error.HTTPError as exc:
+              if exc.code != 304:
+                  problem("docker", f"{action} {OBS_CONTAINER}: HTTP {exc.code} {exc.reason}")
+                  return False
+          except Exception as exc:
+              problem("docker", f"{action} {OBS_CONTAINER}: {exc}")
+              return False
+          recovered("docker")
+          return True
+
+
       def set_streaming(on):
           """Bring OBS to the wanted state. False on any failure, so the caller
           retries on the next poll -- OBS may simply still be starting."""
@@ -430,10 +503,28 @@ configs:
               return False
 
 
+      def go_live():
+          if MANAGE_OBS and not obs_container("start"):
+              return False
+          # Right after a start OBS needs a while before obs-websocket answers;
+          # until then this fails quietly and the next poll tries again.
+          return set_streaming(True)
+
+
+      def go_off_air():
+          if not MANAGE_OBS:
+              return set_streaming(False)
+          # End the broadcast properly first, best effort: OBS may already be down,
+          # and stopping the container ends the stream anyway.
+          set_streaming(False)
+          return obs_container("stop")
+
+
       def main():
           if not OBS_PASSWORD:
               log("OBS_WS_PASSWORD is not set; it must match the OBS container's")
-          log(f"watching {BAMBUBOARD} (stream when {WHEN}, stop {STOP_DELAY}s after), obs at {OBS_HOST}:{OBS_PORT}")
+          managed = f", obs container {OBS_CONTAINER} via {DOCKER}" if MANAGE_OBS else ""
+          log(f"watching {BAMBUBOARD} (live when {WHEN}, off {STOP_DELAY}s after){managed}")
           applied = None  # the state last brought about, None until the first change
           off_since = None
           while True:
@@ -447,10 +538,13 @@ configs:
                       off_since = off_since or now
                       decision = False if now - off_since >= STOP_DELAY else applied
                   if decision is not None and decision != applied:
-                      if applied is None and decision is False:
-                          # Idle at startup: not a print ending, so leave OBS alone.
+                      if applied is None and decision is False and not MANAGE_OBS:
+                          # Off at startup is not a change, so leave the stream alone.
+                          # With MANAGE_OBS it is acted on (after STOP_DELAY), or a
+                          # redeploy would leave OBS running until the printer next
+                          # switched on and off.
                           applied = False
-                      elif set_streaming(decision):
+                      elif (go_live() if decision else go_off_air()):
                           applied = decision
               time.sleep(POLL)
 
@@ -461,6 +555,10 @@ configs:
 networks:
   web-net:
     external: true
+  # autostream <-> docker-proxy only. internal: no route out, and nothing on
+  # web-net can reach the proxy.
+  control:
+    internal: true
 
 volumes:
   obs-config:
