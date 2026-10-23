@@ -775,7 +775,7 @@ browser --https--> traefik --> obs-relay --> obs     https://obs.liaxum.fr     t
 
 | File | Deployed as | Runs on |
 |---|---|---|
-| `apps/printcast/compose.yml` | stack `printcast` | `bambuboard` on liaxum-mini (it has to be on the printer's LAN), `obs-relay` on liaxum-gaming |
+| `apps/printcast/compose.yml` | stack `printcast` | `bambuboard` and `camera` (go2rtc) on liaxum-mini (they have to be on the printer's LAN), `obs-relay` on liaxum-gaming |
 | `apps/printcast/obs/compose.yml` | **standalone compose** | liaxum-gaming |
 
 BambuBoard is an ordinary swarm service with Traefik labels and **no
@@ -981,13 +981,26 @@ in its string for that reason.
    the Live preview.
 2. At `https://obs.liaxum.fr`, set **Settings → Video → Base (Canvas)
    Resolution** to that size.
-3. Add one **Browser** source, *Local file* unticked, sized to the canvas,
-   URL **`http://bambuboard:8080/live`** (`?transparent=1` lets it layer
-   over other sources). That is the swarm service's short name on
-   `web-net`; `http://printcast_bambuboard:8080/live` is the same service.
-   **Not the public address.** That one is behind the Traefik login, and a
-   Browser source cannot answer a login prompt: it gets a 401 and draws
-   nothing, with no error in OBS's log.
+3. Build the scene from two sources, camera at the bottom, overlay on top:
+   - **Media Source** (the camera): *Local File* unticked, *Input*
+     `rtsp://printcast_camera:8554/printer`, *Use hardware decoding when
+     available* ticked, *FFmpeg Options* `rtsp_transport=tcp`. That is the
+     stack's `camera` service (go2rtc), passing the printer's stream through
+     untouched, and OBS decodes it on the GPU.
+   - **Browser** (the overlay): *Local file* unticked, sized to the canvas,
+     URL **`http://bambuboard:8080/live?transparent=1`**. That is the swarm
+     service's short name on `web-net`.
+     **Not the public address.** That one is behind the Traefik login, and a
+     Browser source cannot answer a login prompt: it gets a 401 and draws
+     nothing, with no error in OBS's log.
+
+   In BambuBoard's **Layout**, delete the camera layer and publish again.
+   Its camera tile lags on stream by design: BambuBoard re-encodes the
+   printer's 1080p30 to MPEG-1 on the mini's CPU, and OBS then decodes that
+   in JavaScript in a browser source with no GPU. It would also hold a second
+   connection to a printer that allows few at once. (The layout editor's
+   *"Browser can't play RTSP/SDP directly"* note on that layer is only about
+   its own preview.)
 4. **Settings → Output**: an NVIDIA NVENC H.264 encoder. **Settings →
    Stream**: the service and stream key. Both persist in the
    `printcast-obs_obs-config` volume.

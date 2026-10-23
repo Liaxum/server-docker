@@ -75,6 +75,41 @@ services:
         - "traefik.http.middlewares.printcast-auth.basicauth.users=${PRINTCAST_AUTH:?set PRINTCAST_AUTH to an htpasswd line}"
         - "traefik.http.services.printcast.loadbalancer.server.port=8080"
 
+  # The printer's camera for OBS, as plain RTSP on web-net:
+  # rtsp://printcast_camera:8554/printer, played by an OBS Media Source.
+  #
+  # BambuBoard's own camera tile is unusable on stream: its ffmpeg decodes
+  # the printer's 1080p30 H.264 and re-encodes it to MPEG-1 on the mini's
+  # CPU, and OBS then decodes that in JavaScript inside a browser source
+  # with no GPU. Both stages drop frames. go2rtc instead passes the
+  # printer's stream through untouched -- no re-encode, next to no CPU --
+  # and OBS decodes it natively, on the GPU where it can.
+  #
+  # It opens the printer's stream only while someone watches. The printer
+  # allows few camera connections at once, so take the camera layer out of
+  # the BambuBoard layout; otherwise BambuBoard's relay holds one too.
+  #
+  # rtspx is RTSPS without certificate verification: the printer's
+  # certificate is issued by Bambu for its serial number, not for its IP.
+  # The config is inline YAML (go2rtc reads a -config value starting with
+  # "{" as config, not a path). BAMBU_HOST and BAMBU_ACCESS_CODE are
+  # enforced as required by bambuboard above; plain ${} here, because the
+  # docker CLI skips a ":?" with another ${} after it in the same string.
+  camera:
+    image: alexxit/go2rtc:latest
+    command:
+      - "go2rtc"
+      - "-config"
+      - "{streams: {printer: 'rtspx://bblp:${BAMBU_ACCESS_CODE}@${BAMBU_HOST}:322/streaming/live/1'}, rtsp: {listen: ':8554'}, api: {listen: ':1984'}}"
+    networks:
+      - web-net
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          # On the printer's LAN, like bambuboard.
+          - node.hostname == ${MINI_HOSTNAME:-liaxum-mini}
+
   # Traefik reads labels only off swarm services, and OBS is a standalone
   # container, so this relay carries its labels and forwards raw TCP to it by
   # container name across web-net -- raw so the desktop's WebSockets pass
