@@ -14,6 +14,7 @@
 #
 #   printer --rtsps + mqtts--> bambuboard (liaxum-mini) --web-net /live--> obs (liaxum-gaming) --> Twitch/YouTube
 #   browser --https--> traefik --> bambuboard          (print.liaxum.fr)
+#   browser --https--> traefik --> camera (go2rtc)     (print.liaxum.fr/camera)
 #   browser --https--> traefik --> obs-relay --> obs   (obs.liaxum.fr)
 #
 # OBS itself is NOT in this stack: swarm cannot hand a service a GPU. It is the
@@ -85,9 +86,14 @@ services:
   # printer's stream through untouched -- no re-encode, next to no CPU --
   # and OBS decodes it natively, on the GPU where it can.
   #
-  # It opens the printer's stream only while someone watches. The printer
-  # allows few camera connections at once, so take the camera layer out of
-  # the BambuBoard layout; otherwise BambuBoard's relay holds one too.
+  # It opens the printer's stream only while someone watches, and only once
+  # however many watch. That matters: the printer takes ONE camera
+  # connection at a time, and a second one knocks both off after a couple
+  # of seconds -- then each reconnects and knocks the other off again. So
+  # go2rtc is the only thing that talks to the camera. OBS plays its RTSP;
+  # the browser preview is its own player at /camera on BambuBoard's
+  # address, behind the same login; and BambuBoard's camera stays unused --
+  # no camera layer in its layout, its camera tile left closed.
   #
   # rtspx is RTSPS without certificate verification: the printer's
   # certificate is issued by Bambu for its serial number, not for its IP.
@@ -100,7 +106,7 @@ services:
     command:
       - "go2rtc"
       - "-config"
-      - "{streams: {printer: 'rtspx://bblp:${BAMBU_ACCESS_CODE}@${BAMBU_HOST}:322/streaming/live/1'}, rtsp: {listen: ':8554'}, api: {listen: ':1984'}}"
+      - "{streams: {printer: 'rtspx://bblp:${BAMBU_ACCESS_CODE}@${BAMBU_HOST}:322/streaming/live/1'}, rtsp: {listen: ':8554'}, api: {listen: ':1984', base_path: '/camera'}}"
     networks:
       - web-net
     deploy:
@@ -109,6 +115,22 @@ services:
         constraints:
           # On the printer's LAN, like bambuboard.
           - node.hostname == ${MINI_HOSTNAME:-liaxum-mini}
+      labels:
+        # The preview: https://print.liaxum.fr/camera/stream.html?src=printer&mode=mse
+        # (mode=mse: video over the page's own WebSocket; WebRTC, the
+        # player's first choice, cannot get through Traefik.) base_path
+        # above makes go2rtc serve everything under /camera, so the path
+        # passes through unchanged. The longer rule wins over
+        # bambuboard's router for that path.
+        - "traefik.enable=true"
+        - "traefik.swarm.network=web-net"
+        - "traefik.http.routers.printcast-camera.rule=Host(`${PRINT_SUBDOMAIN:-print}.${DOMAIN:-liaxum.fr}`) && PathPrefix(`/camera`)"
+        - "traefik.http.routers.printcast-camera.entrypoints=websecure"
+        - "traefik.http.routers.printcast-camera.tls=true"
+        # bambuboard's login. Required: go2rtc's web UI can add streams and
+        # rewrite its config.
+        - "traefik.http.routers.printcast-camera.middlewares=printcast-auth"
+        - "traefik.http.services.printcast-camera.loadbalancer.server.port=1984"
 
   # Traefik reads labels only off swarm services, and OBS is a standalone
   # container, so this relay carries its labels and forwards raw TCP to it by

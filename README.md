@@ -994,11 +994,18 @@ in its string for that reason.
      Browser source cannot answer a login prompt: it gets a 401 and draws
      nothing, with no error in OBS's log.
 
-   In BambuBoard's **Layout**, delete the camera layer and publish again.
-   Its camera tile lags on stream by design: BambuBoard re-encodes the
+   In BambuBoard's **Layout**, delete the camera layer and publish again,
+   and leave BambuBoard's own camera view closed. **The printer takes one
+   camera connection at a time.** A second one -- BambuBoard's relay next
+   to go2rtc -- knocks both off after a couple of seconds, and they keep
+   knocking each other off: the camera shows for two seconds and vanishes,
+   in OBS and in BambuBoard alike. go2rtc must be the only one connected.
+   To watch the camera in a browser, use go2rtc's player instead, behind
+   the same login: `https://print.liaxum.fr/camera/stream.html?src=printer&mode=mse`.
+   It shares go2rtc's one connection with OBS.
+   (BambuBoard's camera tile would lag on stream anyway: it re-encodes the
    printer's 1080p30 to MPEG-1 on the mini's CPU, and OBS then decodes that
-   in JavaScript in a browser source with no GPU. It would also hold a second
-   connection to a printer that allows few at once. (The layout editor's
+   in JavaScript in a browser source with no GPU. The layout editor's
    *"Browser can't play RTSP/SDP directly"* note on that layer is only about
    its own preview.)
 4. **Settings → Output**: an NVIDIA NVENC H.264 encoder. **Settings →
@@ -1105,6 +1112,18 @@ they do, these are the symptoms:
   Chromium takes the profile for one in use on another machine. The script
   deletes the lock before OBS starts.
 
+If the camera appears for a couple of seconds and then drops, over and
+over, something else holds the printer's camera: BambuBoard's camera view
+or a camera layer in its published layout, Bambu Studio, or Bambu Handy.
+go2rtc shows who it is connected to:
+
+```bash
+docker exec printcast-obs curl -s http://printcast_camera:1984/camera/api/streams; echo
+```
+
+One `producers` entry is go2rtc's link to the printer; each `consumers`
+entry is a viewer (OBS shows up as `Lavf...`).
+
 If NVENC is missing from the encoder list, the GPU is not reaching containers:
 `docker run --rm --gpus all ubuntu nvidia-smi` on the gaming PC must list it.
 While streaming, `nvidia-smi` on the gaming PC should show an `obs` process.
@@ -1115,6 +1134,11 @@ mini, and sends silent audio, so treat it as a fallback for when the gaming PC
 is off, not a replacement.
 
 ### Exposure
+
+The camera player at `print.liaxum.fr/camera` sits behind BambuBoard's
+login. Inside `web-net`, go2rtc's RTSP (8554) and API (1984) have no login
+at all, and the API shows the printer's access code: every container on
+`web-net` can reach them.
 
 `obs.liaxum.fr` is a full remote desktop on the internet, holding your stream
 key, behind one password. Tailscale already reaches the gaming PC from any of
