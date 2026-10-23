@@ -1085,6 +1085,12 @@ they do, these are the symptoms:
   marker (`.sentinel/run_*`) behind, so the next launch looks like crash
   recovery. The script deletes stale markers before OBS starts. OBS 32 has
   no command-line flag for this.
+- **Every Browser source is blank after a redeploy**, even
+  `https://example.com`, with nothing in OBS's log. Chromium's profile lock
+  (`plugin_config/obs-browser/SingletonLock -> <hostname>-<pid>`) was left by
+  the previous container, and a recreated container has a new hostname, so
+  Chromium takes the profile for one in use on another machine. The script
+  deletes the lock before OBS starts.
 
 If NVENC is missing from the encoder list, the GPU is not reaching containers:
 `docker run --rm --gpus all ubuntu nvidia-smi` on the gaming PC must list it.

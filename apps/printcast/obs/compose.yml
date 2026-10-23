@@ -87,6 +87,15 @@ services:
       # any marker is stale by definition. (OBS 32 has no flag for this: the
       # old --disable-shutdown-check is gone.)
       #
+      # It clears the Browser source's Chromium profile lock for the same
+      # reason. Chromium marks its profile with SingletonLock -> <hostname>-
+      # <pid>; a container stopped by signal leaves it behind, and a
+      # recreated container has a new hostname. Chromium then takes the
+      # profile for one in use on another machine and refuses it: the plugin
+      # still loads, nothing reaches OBS's log, and every Browser source
+      # stays blank. A plain restart keeps the hostname, so only redeploys
+      # showed it.
+      #
       # The autostart line is what the base image launches once the desktop
       # is up: on first start it copies /defaults/autostart into the config
       # volume (X11, the base's default; Wayland would read autostart_wayland).
@@ -119,6 +128,8 @@ services:
         cd /config/.config/obs-studio || exit 0
         # Every container stop leaves a run marker that reads as a crash.
         rm -f .sentinel/run_*
+        # And a Chromium profile lock naming the old container's hostname.
+        find plugin_config/obs-browser -maxdepth 3 -name 'Singleton*' -delete 2>/dev/null
         # Browser source off the GPU.
         touch user.ini global.ini
         if grep -q '^BrowserHWAccel=' user.ini; then sed -i 's/^BrowserHWAccel=.*/BrowserHWAccel=false/' user.ini
