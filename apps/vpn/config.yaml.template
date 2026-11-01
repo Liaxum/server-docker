@@ -20,11 +20,19 @@ database:
 
 dns:
   base_domain: vpn.internal
+  # AdGuard Home on the manager (apps/adguard). Tailscale applies this only
+  # while a device is connected and restores the device's own resolvers when
+  # it disconnects. The cost: a connected device has no DNS while AdGuard Home
+  # is down. No public fallback on purpose -- Tailscale does not treat a second
+  # entry strictly as a fallback, so it would let lookups skip the filter.
+  #
+  # The manager itself must not take this (tailscale --accept-dns=false, which
+  # bootstrap.sh sets): its own queries would reach AdGuard Home from Docker's
+  # gateway and be dropped, and it could not pull an image to recover.
   nameservers:
     global:
-      - 1.1.1.1
-      - 8.8.8.8
-  override_local_dns: false
+      - ${MESH_ADDR}
+  override_local_dns: true
 
 derp:
   server:

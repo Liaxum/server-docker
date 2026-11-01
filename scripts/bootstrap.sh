@@ -1127,7 +1127,12 @@ join_mesh() {
   # the container from Docker's gateway rather than from its 100.64.x
   # address, and AdGuard Home's allow-list drops it. The manager advertises
   # no subnet routes, so nothing else depends on the masquerade.
-  host_run "sudo tailscale up --timeout 120s --login-server https://$VPN_SUBDOMAIN.$DOMAIN --snat-subnet-routes=false ${key:+--authkey $key} >/dev/null" || true
+  #
+  # --accept-dns=false: headscale points mesh DNS at AdGuard Home on this
+  # host. The manager's own queries to it would arrive from Docker's gateway
+  # and be dropped, and a manager that resolves through its own container
+  # cannot pull that container's image back after an outage.
+  host_run "sudo tailscale up --timeout 120s --login-server https://$VPN_SUBDOMAIN.$DOMAIN --snat-subnet-routes=false --accept-dns=false ${key:+--authkey $key} >/dev/null" || true
 
   local i got
   printf '    waiting for an address' >&2
@@ -1187,7 +1192,7 @@ Run this on ${SSH_TARGET:-this host}, then come back:
   C=\$(docker ps -qf name=${VPN_STACK}_core)
   docker exec \$C headscale users list          # note the id of $MESH_USER
   docker exec \$C headscale preauthkeys create --user <id> --reusable --expiration 1h
-  sudo tailscale up --timeout 120s --login-server https://$VPN_SUBDOMAIN.$DOMAIN --snat-subnet-routes=false --authkey <key>
+  sudo tailscale up --timeout 120s --login-server https://$VPN_SUBDOMAIN.$DOMAIN --snat-subnet-routes=false --accept-dns=false --authkey <key>
 
 EOF
   [[ -t 0 ]] || return 1
