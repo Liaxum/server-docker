@@ -22,7 +22,7 @@ set -euo pipefail
 cd -- "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # The bootstrap floor: what Komodo needs in order to exist. Everything above
-# this line -- filebrowser, gitlab, pihole, portfolio, games -- is deployed by
+# this line -- filebrowser, gitlab, pihole, adguard, portfolio, games -- is deployed by
 # Komodo itself and is not needed to bring the cluster up.
 STARTUP_PATHS=(scripts traefik apps/vpn apps/nfs apps/monitor)
 

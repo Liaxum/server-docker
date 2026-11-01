@@ -16,6 +16,7 @@ centralized NFS persistent storage and a Traefik reverse proxy.
 | `traefik/compose.yml` | stack `traefik` | TLS termination, routing |
 | `apps/nfs/compose.yml` | **standalone compose** on the VPS | exports `/shared` over Tailscale |
 | `apps/filebrowser/compose.yml` | stack `files` | web UI on the shared volume |
+| `apps/adguard/compose.yml` | stack `adguard` | AdGuard Home: DNS filtering for the mesh — **replaces** `apps/pihole` |
 | `apps/monitor/compose.yml` | stack `monitor` | Komodo core, Mongo, global agents, MCP |
 | `apps/printcast/compose.yml` | stack `printcast` | BambuBoard: printer camera + telemetry overlay, on Traefik |
 | `apps/printcast/obs/compose.yml` | **standalone compose** on `liaxum-gaming` | OBS with NVENC, streams the overlay |
@@ -759,6 +760,115 @@ sudo systemctl restart systemd-resolved
 `/etc/resolv.conf` must then point somewhere real rather than at `127.0.0.53`,
 or the host loses DNS the moment Pi-hole is down — which takes Tailscale and
 the image pulls with it.
+
+## AdGuard Home
+
+`apps/adguard/compose.yml` is a drop-in replacement for Pi-hole, built the
+same way: a swarm stack pinned to the manager, 53 published in host mode, the
+UI behind Traefik at `https://adguard.liaxum.fr`.
+
+**It replaces Pi-hole; the two cannot both run.** Both bind 53 on the
+manager, so the second one to start cannot bind and gives up after three
+attempts. Switch over with:
+
+```bash
+docker stack rm pihole
+docker stack deploy -c apps/adguard/compose.yml adguard   # with the environment below
+```
+
+Pi-hole's volumes are left behind, so going back is `docker stack rm adguard`
+and redeploying Pi-hole. Nothing migrates between them: blocklists, allow and
+deny rules and per-client settings have to be set up again in AdGuard Home.
+
+Everything in [Pi-hole and port 53](#pi-hole-and-port-53) applies unchanged:
+the `DOCKER-USER` firewall rules, the outside check, and the
+`systemd-resolved` fix (use `docker service ps --no-trunc adguard_core`).
+
+### What is different from Pi-hole
+
+- **It drops outside queries itself.** `allowed_clients` is seeded with the
+  mesh's prefixes, and anything else gets no reply at all — so an outside
+  query times out even before the firewall. Pi-hole here has no such control
+  (`listeningMode=ALL` decides by interface, and it only sees Docker's).
+  It is a second layer, not a substitute: it can be edited in the UI, and
+  one careless edit there reopens the resolver. Keep the firewall rules.
+- **Encrypted upstreams.** It forwards to Cloudflare and Google over
+  DNS-over-HTTPS rather than plain UDP, so the VPS provider's network sees
+  TLS, not the names the mesh looks up.
+- **No setup wizard.** The image normally starts a wizard on `:3000`, and
+  through Traefik that is the public internet: whoever finishes it first
+  owns the admin account and the mesh's DNS. The entrypoint writes a config
+  before the first start instead, which removes the wizard's endpoints
+  entirely.
+- **Per-address rate limiting.** AdGuard Home's default rate limit (20
+  queries a second) applies per /24, and every mesh client sits in
+  `100.64.0.x` — the whole mesh would share it. It is seeded per address.
+
+### Stack environment
+
+| Variable | Default | |
+| --- | --- | --- |
+| `ADGUARD_AUTH` | — | **required**; bcrypt htpasswd line, applied on **every** start |
+| `ADGUARD_UPSTREAMS` | Cloudflare + Google DoH | space separated; **first start only** |
+| `ADGUARD_ALLOWED_CLIENTS` | `100.64.0.0/10 fd7a:115c:a1e0::/48 127.0.0.0/8 ::1` | space separated; **first start only** |
+| `DOMAIN` | `liaxum.fr` | |
+| `ADGUARD_SUBDOMAIN` | `adguard` | the certificate must cover it |
+| `MANAGER_HOSTNAME` | `liaxum-vps` | must match `docker node ls` |
+| `TZ` | `Europe/Paris` | |
+
+`ADGUARD_AUTH` is the same format as `PRINTCAST_AUTH`, with the same rule:
+**single-quote it**, in Komodo's Environment and in `stack.env`, because both
+are shell-sourced and an unquoted `$2y$05$…` is expanded away.
+
+```
+ADGUARD_AUTH = '[[ADGUARD_AUTH]]'
+```
+
+```bash
+docker run --rm httpd:alpine htpasswd -nbB admin 'your-password'
+```
+
+Unlike Pi-hole's password, a mangled one does not get through: the
+entrypoint checks it is a 60-character bcrypt hash and exits with a message
+saying how to fix it, visible in `docker service logs adguard_core`. AdGuard
+Home has no password change in its UI, so `ADGUARD_AUTH` is rewritten into
+the config on every start: change it and redeploy to rotate.
+
+**First start only** means what it says. The upstreams and allowed clients
+are written into `AdGuardHome.yaml` when the config volume is empty; after
+that the file belongs to AdGuard Home, the UI edits it, and changing those
+variables does nothing. To change them, use **Settings → DNS settings**. If
+you changed `MESH_CIDR` in `bootstrap.env`, set `ADGUARD_ALLOWED_CLIENTS`
+before the first deploy, or no mesh client will get an answer.
+
+Docker's private ranges are kept out of the default allow-list on purpose.
+A query that docker-proxy relays instead of DNAT — the host querying its own
+published port, and possibly IPv6 forwarded to this IPv4-only container —
+arrives from the gateway's `172.x` address whoever really sent it, so
+allowing `172.16.0.0/12` would allow all of those. The cost: the VPS itself
+cannot use AdGuard Home through `127.0.0.1:53`. Point its
+`/etc/resolv.conf` at a real upstream, as the Pi-hole section already says.
+
+### Making clients use it
+
+Deploying it does not make anything use it. `apps/vpn/config.yaml.template`
+hands mesh clients `1.1.1.1` and `8.8.8.8`, with `override_local_dns:
+false`, so clients keep their own resolvers. Either point a device at
+`100.64.0.1` by hand, or change headscale's `nameservers.global` to
+`100.64.0.1` and `override_local_dns` to `true` — which also makes the whole
+mesh lose DNS whenever this service is down.
+
+### Login lockout
+
+Five failed logins block the UI for 15 minutes — but AdGuard Home keys that
+block on the connection's address, which behind Traefik is Traefik's for
+everyone, not the client's. So anyone on the internet can lock you out of
+the UI by failing five logins. DNS keeps working; only the UI is affected. The
+block is held in memory, so it clears on restart:
+
+```bash
+docker service update --force adguard_core
+```
 
 ## Printer stream
 

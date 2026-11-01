@@ -1,0 +1,187 @@
+# docker stack deploy -c apps/adguard/compose.yml adguard
+#
+# AdGuard Home: network-wide DNS filtering for the mesh, pinned to the VPS.
+#
+# REPLACES apps/pihole -- it does not run beside it. Both publish 53 on the
+# manager in host mode, so whichever deploys second cannot bind and stops after
+# three attempts. `docker stack rm pihole` first. See "AdGuard Home" in the
+# README.
+#
+# Values come from the stack environment. Everything has a default that matches
+# this cluster except ADGUARD_AUTH, which is required and fails the deploy if it
+# is missing.
+#
+# The port-53 warning from apps/pihole applies unchanged: swarm cannot bind a
+# published port to one address, so this listens on 53 on EVERY interface of
+# the manager, the public one included. Unlike Pi-hole, AdGuard Home can drop
+# queries by client address itself (ADGUARD_ALLOWED_CLIENTS below), so an
+# outside query gets no answer even before the firewall. Keep the firewall
+# rules from "Pi-hole and port 53" in the README anyway: the allow-list is
+# editable from the web UI, and one careless edit there would reopen it.
+services:
+  core:
+    image: adguard/adguardhome:latest
+    networks:
+      - web-net
+
+    # Host mode, for the same reason as Pi-hole: the routing mesh source-NATs
+    # every query, which would collapse every client into one -- and, here,
+    # make ADGUARD_ALLOWED_CLIENTS useless, since it matches on the source
+    # address the container sees. Host mode keeps the real 100.64.x address.
+    ports:
+      - target: 53
+        published: 53
+        protocol: tcp
+        mode: host
+      - target: 53
+        published: 53
+        protocol: udp
+        mode: host
+
+    environment:
+      - TZ=${TZ:-Europe/Paris}
+
+      # Required, with no default on purpose. A bcrypt htpasswd line, the same
+      # format as PRINTCAST_AUTH:
+      #   docker run --rm httpd:alpine htpasswd -nbB admin 'your-password'
+      # Single-quote it wherever it is written down -- Komodo shell-sources the
+      # environment and would expand every $ in the hash otherwise.
+      #
+      # Applied on EVERY start, not just the first, so changing it and
+      # redeploying is how the password is rotated. AdGuard Home has no UI for
+      # that.
+      - ADGUARD_AUTH=${ADGUARD_AUTH:?set ADGUARD_AUTH in the stack environment}
+
+      # The rest is written into AdGuardHome.yaml on the FIRST start only.
+      # After that the file belongs to AdGuard Home and these are ignored;
+      # change them in the web UI (Settings -> DNS settings).
+      #
+      # Space separated. DNS-over-HTTPS to the same two providers headscale
+      # hands out in apps/vpn/config.yaml.template, so mesh clients get the
+      # same answers whichever resolver they reach -- but encrypted, so the
+      # VPS provider's network sees TLS rather than every name the mesh looks
+      # up.
+      - ADGUARD_UPSTREAMS=${ADGUARD_UPSTREAMS:-https://dns.cloudflare.com/dns-query https://dns.google/dns-query}
+
+      # Space separated; addresses, CIDRs or ClientIDs. Anything else is
+      # dropped without a reply. The defaults are headscale's v4 and v6
+      # prefixes (MESH_CIDR in bootstrap.env, and the fixed v6 prefix in
+      # apps/vpn/config.yaml.template) plus loopback. Change the first one if
+      # you changed MESH_CIDR.
+      #
+      # Docker's private ranges (172.16.0.0/12, 10.0.0.0/8) are left out on
+      # purpose. A query relayed by docker-proxy rather than DNAT -- the host
+      # querying its own published port, or IPv6 forwarded to this IPv4-only
+      # container -- arrives from the gateway address, whoever really sent it.
+      # Allowing those ranges would allow every such query.
+      - ADGUARD_ALLOWED_CLIENTS=${ADGUARD_ALLOWED_CLIENTS:-100.64.0.0/10 fd7a:115c:a1e0::/48 127.0.0.0/8 ::1}
+
+    # The image would otherwise start the setup wizard on :3000 -- reachable by
+    # anyone through Traefik, and whoever completes it first owns the admin
+    # account and the mesh's DNS. Seeding the config skips the wizard entirely:
+    # with a config present the /control/install endpoints are gone.
+    #
+    # $$ is an escaped $ -- compose interpolates the file before the shell
+    # ever sees it.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        umask 077
+        conf=/opt/adguardhome/conf/AdGuardHome.yaml
+
+        # Refuse a mangled hash loudly. Unquoted in a shell-sourced env file,
+        # "admin:$$2y$$05$$..." arrives as "admin:y..." and AdGuard Home would
+        # start happily with a password nothing can match.
+        user=$${ADGUARD_AUTH%%:*}
+        hash=$${ADGUARD_AUTH#*:}
+        case "$$hash" in
+          '$$2'[aby]'$$'[0-9][0-9]'$$'*) ;;
+          *) hash= ;;
+        esac
+        if [ -z "$$user" ] || [ "$$user" = "$$ADGUARD_AUTH" ] || [ "$${#hash}" -ne 60 ]; then
+          echo "ADGUARD_AUTH is not a bcrypt htpasswd line (user:\$$2y\$$...)." >&2
+          echo "Generate one with: docker run --rm httpd:alpine htpasswd -nbB admin 'password'" >&2
+          echo "and single-quote it in the stack environment." >&2
+          exit 1
+        fi
+
+        if [ ! -s "$$conf" ]; then
+          echo "no config yet: seeding $$conf"
+          mkdir -p "$${conf%/*}"
+          {
+            echo 'http:'
+            echo '  address: 0.0.0.0:80'
+            echo 'users:'
+            echo "  - name: $$user"
+            echo "    password: $$hash"
+            echo 'dns:'
+            echo '  bind_hosts:'
+            echo '    - 0.0.0.0'
+            echo '  port: 53'
+            # The default limits each /24 together, and every mesh client
+            # sits in 100.64.0.x: the whole mesh would share 20 queries a
+            # second. Per address instead.
+            echo '  ratelimit_subnet_len_ipv4: 32'
+            echo '  ratelimit_subnet_len_ipv6: 128'
+            echo '  upstream_dns:'
+            for u in $$ADGUARD_UPSTREAMS; do echo "    - $$u"; done
+            echo '  allowed_clients:'
+            for c in $$ADGUARD_ALLOWED_CLIENTS; do echo "    - $$c"; done
+            # AdGuard Home fills in every other field with its defaults and
+            # migrates this up to whatever schema the image speaks.
+            echo 'schema_version: 34'
+          } > "$$conf"
+        fi
+
+        # Keep the login in step with ADGUARD_AUTH on every start: rewrite the
+        # first user's name and password inside the top-level users: block.
+        awk -v u="$$user" -v h="$$hash" '
+          /^[^ ]/ { inusers = ($$0 == "users:") }
+          inusers && !n && /^  - name: / { print "  - name: " u; n = 1; next }
+          inusers && !p && /^    password: / { print "    password: " h; p = 1; next }
+          { print }
+        ' "$$conf" > "$$conf.tmp"
+        mv "$$conf.tmp" "$$conf"
+
+        exec /opt/adguardhome/AdGuardHome --no-check-update \
+          -c "$$conf" -w /opt/adguardhome/work
+
+    volumes:
+      - adguard-conf:/opt/adguardhome/conf
+      - adguard-work:/opt/adguardhome/work
+
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          # Defaulted, never bare -- an empty hostname matches no node and the
+          # service sits at 0/1 with nothing to say why.
+          - node.hostname == ${MANAGER_HOSTNAME:-liaxum-vps}
+
+      # Same reasoning as Pi-hole: a task that cannot bind 53 (systemd-resolved,
+      # or Pi-hole still running) stops after three tries instead of churning.
+      restart_policy:
+        condition: on-failure
+        delay: 10s
+        max_attempts: 3
+        window: 120s
+
+      labels:
+        - "traefik.enable=true"
+        - "traefik.swarm.network=web-net"
+
+        - "traefik.http.routers.adguard.rule=Host(`${ADGUARD_SUBDOMAIN:-adguard}.${DOMAIN:-liaxum.fr}`)"
+        - "traefik.http.routers.adguard.entrypoints=websecure"
+        - "traefik.http.routers.adguard.tls=true"
+
+        # The seeded http.address. / redirects to the login page by itself.
+        - "traefik.http.services.adguard.loadbalancer.server.port=80"
+
+networks:
+  web-net:
+    external: true
+
+volumes:
+  adguard-conf:
+  adguard-work:
