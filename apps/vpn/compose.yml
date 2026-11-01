@@ -43,7 +43,6 @@ services:
         - "traefik.http.routers.headscale.rule=Host(`${VPN_SUBDOMAIN:-vpn}.${DOMAIN:-liaxum.fr}`)"
         - "traefik.http.routers.headscale.entrypoints=websecure"
         - "traefik.http.routers.headscale.tls=true"
-        - "traefik.http.routers.headscale.tls.certresolver=letsencrypt"
         - "traefik.http.services.headscale.loadbalancer.server.port=8080"
 
   web:
