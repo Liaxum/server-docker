@@ -719,12 +719,29 @@ chain is in `FORWARD`, so this is where the rule belongs:
 # on the manager -- replace eth0 with its public interface (ip route get 1.1.1.1)
 sudo iptables -I DOCKER-USER -i eth0 -p udp --dport 53 -j DROP
 sudo iptables -I DOCKER-USER -i eth0 -p tcp --dport 53 -j DROP
-
-# survive a reboot
-sudo apt install -y iptables-persistent && sudo netfilter-persistent save
 ```
 
 Queries arriving on `tailscale0` are untouched, so mesh clients still resolve.
+
+Those rules are gone after a reboot. **Do not make them persistent with
+`iptables-persistent` on this host:** Ubuntu's `ufw` package declares
+`Breaks: iptables-persistent, netfilter-persistent`, so installing it makes apt
+remove ufw, and with it the NFS rule above. Let ufw load them instead, by
+appending this to the end of `/etc/ufw/after.rules` (again with the right
+interface):
+
+```
+*filter
+:DOCKER-USER - [0:0]
+-A DOCKER-USER -i eth0 -p udp --dport 53 -j DROP
+-A DOCKER-USER -i eth0 -p tcp --dport 53 -j DROP
+COMMIT
+```
+
+Then `sudo ufw reload` and confirm with `sudo iptables -S DOCKER-USER` that
+both DROP rules are listed, once now and once after the next reboot. If they
+are missing after a reboot, Docker reset the chain after ufw loaded it; the
+outside check below is what tells you either way.
 
 ### Check it from outside
 
