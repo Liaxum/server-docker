@@ -804,7 +804,9 @@ the `DOCKER-USER` firewall rules, the outside check, and the
 ### What is different from Pi-hole
 
 - **It drops outside queries itself.** `allowed_clients` is seeded with the
-  mesh's prefixes, and anything else gets no reply at all — so an outside
+  mesh's prefixes, and anything else gets no reply at all. This needs the
+  manager's tailscaled to stop masquerading, or mesh clients are dropped too —
+  see [Mesh clients time out](#mesh-clients-time-out) — so an outside
   query times out even before the firewall. Pi-hole here has no such control
   (`listeningMode=ALL` decides by interface, and it only sees Docker's).
   It is a second layer, not a substitute: it can be edited in the UI, and
@@ -874,6 +876,36 @@ false`, so clients keep their own resolvers. Either point a device at
 `100.64.0.1` by hand, or change headscale's `nameservers.global` to
 `100.64.0.1` and `override_local_dns` to `true` — which also makes the whole
 mesh lose DNS whenever this service is down.
+
+### Mesh clients time out
+
+`dig @100.64.0.1 example.com` from a mesh device gets no reply at all, while
+the service is running. Watch what reaches the container:
+
+```bash
+sudo tcpdump -ni docker_gwbridge port 53
+```
+
+If the queries arrive from `172.18.0.1` rather than the device's `100.64.x`
+address, tailscaled is masquerading them. On Linux it installs a MASQUERADE
+rule (`iptables -t nat -S ts-postrouting`) for everything it forwards out of
+`tailscale0`, and a query to a published port is forwarded. AdGuard Home then
+sees Docker's gateway, which is not in `allowed_clients`, and drops it
+silently. Turn the masquerade off on the manager:
+
+```bash
+sudo tailscale set --snat-subnet-routes=false
+sudo iptables -t nat -S ts-postrouting    # only "-N ts-postrouting" should remain
+```
+
+It persists in tailscaled's prefs, and `bootstrap.sh` passes it when it joins
+the manager. It only matters to a node that advertises subnet routes, which
+the manager does not (`tailscale debug prefs | grep AdvertiseRoutes` shows
+`null`); if it ever does, devices on those subnets need a route back to the
+mesh.
+
+Do not fix this by adding `172.16.0.0/12` to the allow-list instead. Every
+client would then look the same, and the list would stop excluding anything.
 
 ### Login lockout
 

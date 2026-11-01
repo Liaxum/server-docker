@@ -27,7 +27,11 @@ services:
     # Host mode, for the same reason as Pi-hole: the routing mesh source-NATs
     # every query, which would collapse every client into one -- and, here,
     # make ADGUARD_ALLOWED_CLIENTS useless, since it matches on the source
-    # address the container sees. Host mode keeps the real 100.64.x address.
+    # address the container sees. Host mode keeps the real 100.64.x address --
+    # but only once tailscaled stops masquerading what it forwards, which it
+    # does by default: `tailscale set --snat-subnet-routes=false` on the
+    # manager. Without that every mesh query arrives as 172.18.0.1 and is
+    # dropped. See "Mesh clients time out" in the README.
     ports:
       - target: 53
         published: 53
